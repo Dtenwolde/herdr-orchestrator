@@ -1,0 +1,6 @@
+state/
+__pycache__/
+TODO.md
+briefings/
+orchestrator.toml
+CLAUDE.local.md

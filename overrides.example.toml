@@ -1,0 +1,28 @@
+# Overrides for bin/herdr-status, applied when ranking the board and rendering TODO.md.
+#
+# Key a table by workspace label (as on the board; remote ones as "host:label") or by PR
+# ("28027", or "owner/repo#28027" when the number is ambiguous). Quote the keys.
+#
+#   parked = true              move everything for it to PARKED until removed
+#   snooze_until = 2026-11-10  PARKED until that day starts (local); a datetime or ISO string works too
+#   ignore_question = true     drop "agent ended with a question" items
+#   note = "..."               shown on the board and in TODO.md
+#   links = ["owner/repo#n"]   (workspace) issues/PRs it handles: their inbox activity shows on its card
+#   done = true                (inbox item) dismiss it; done = 2026-11-05 brings it back on newer activity
+#
+#
+# Examples:
+#
+# [workspace."my-feature"]
+# parked = true
+# note = "on hold until the design review"
+#
+# [pr."12345"]
+# snooze_until = 2026-11-10
+# note = "reply after the deadline"
+#
+# [workspace."flaky-tests"]
+# links = ["my-org/my-repo#678"]
+#
+# [pr."my-org/tracker#42"]
+# done = 2026-11-05

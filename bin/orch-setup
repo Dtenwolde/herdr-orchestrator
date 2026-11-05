@@ -1,0 +1,234 @@
+#!/usr/bin/env python3
+"""Set up the orchestrator: check requirements, create local files, wire up Herdr, launch the workspace.
+
+  bin/orch-setup              check requirements and create state/overrides.toml
+  bin/orch-setup --config     also add the sidebar tokens and the prefix+t popup to Herdr's config.toml
+  bin/orch-setup --launch     also open an "orchestrator" workspace: Claude on the left, the board on the right
+
+Nothing here touches your repositories. --config backs up config.toml first, validates the result with
+`herdr config check`, and restores the backup if Herdr rejects it.
+"""
+import argparse
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+from datetime import datetime
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent.parent
+HERDR_CONFIG = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / "herdr" / "config.toml"
+POPUP_KEY = "prefix+t"
+MARKER = "# orchestrator:"
+
+SIDEBAR_TOKENS = '''  [{ token = "$ci", bold = true, rules = [
+      { equals = "✗", fg = "#ff5555" },
+      { equals = "…", fg = "#f1fa8c" },
+      { equals = "✓", fg = "#50fa7b" } ] },
+   { token = "$fb", fg = "#8be9fd", bold = true },
+   { token = "$pr", rules = [
+      { equals = "queued", fg = "#8be9fd" },
+      { equals = "merged", fg = "#bd93f9" },
+      { equals = "closed", fg = "#6272a4" } ] },
+   "branch", "git_status"],'''
+
+
+def sidebar_block():
+    return (f"{MARKER} PR state per workspace (ci ✗/…/✓, fb ✎ feedback / ↻ re-review, pr queued/merged/closed)\n"
+            "[ui.sidebar.spaces]\nrows = [\n  [\"state_icon\", \"workspace\"],\n" + SIDEBAR_TOKENS + "\n]\n")
+
+
+def popup_block(key):
+    return (f"{MARKER} triage popup: enter jumps, ctrl-o opens the link, ctrl-p park, ctrl-s snooze, ctrl-d done\n"
+            f"[[keys.command]]\nkey = \"{key}\"\ntype = \"popup\"\ncommand = \"{ROOT / 'bin' / 'orch-pick'}\"\n"
+            "width = \"90%\"\nheight = \"85%\"\n")
+
+
+def ok(text):
+    print(f"  \033[32m✓\033[0m {text}")
+
+
+def warn(text):
+    print(f"  \033[33m!\033[0m {text}")
+
+
+def fail(text):
+    print(f"  \033[31m✗\033[0m {text}")
+
+
+def output(cmd):
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+        return proc.returncode, (proc.stdout + proc.stderr).strip()
+    except (OSError, subprocess.TimeoutExpired) as error:
+        return 1, str(error)
+
+
+def check():
+    print("Requirements")
+    good = True
+    if sys.version_info >= (3, 11):
+        ok(f"python {sys.version.split()[0]}")
+    else:
+        fail(f"python {sys.version.split()[0]}: need 3.11 or newer (tomllib)")
+        good = False
+    code, text = output(["herdr", "--version"])
+    version = re.search(r"(\d+)\.(\d+)\.(\d+)", text or "")
+    if code or not version:
+        fail("herdr not found (https://herdr.dev)")
+        good = False
+    elif tuple(map(int, version.groups())) < (0, 9, 3):
+        warn(f"herdr {version.group(0)}: tested with 0.9.3 and newer")
+    else:
+        ok(f"herdr {version.group(0)}")
+    if os.environ.get("HERDR_ENV") != "1":
+        warn("not running inside a Herdr pane; the board and popup need to run in Herdr")
+    code, text = output(["gh", "auth", "status"])
+    if code:
+        fail("gh is missing or not logged in (gh auth login)")
+        good = False
+    else:
+        ok("gh logged in")
+    for tool, why in (("git", "required"), ("fzf", "for the prefix+t popup"), ("ssh", "for remote Herdr machines")):
+        if shutil.which(tool):
+            ok(tool)
+        elif tool == "git":
+            fail("git not found")
+            good = False
+        else:
+            warn(f"{tool} not found ({why})")
+    if shutil.which("claude"):
+        ok("claude (Claude Code)")
+    else:
+        warn("claude not found: the board works without it, the orchestrator session and briefings need it")
+    return good
+
+
+def local_files():
+    print("Local files")
+    (ROOT / "state").mkdir(exist_ok=True)
+    overrides = ROOT / "state" / "overrides.toml"
+    if overrides.exists():
+        ok("state/overrides.toml exists")
+    else:
+        shutil.copy(ROOT / "overrides.example.toml", overrides)
+        ok("created state/overrides.toml from overrides.example.toml")
+    if (ROOT / "orchestrator.toml").exists():
+        ok("orchestrator.toml exists")
+    else:
+        print("    optional: cp orchestrator.example.toml orchestrator.toml to change settings")
+
+
+def used_keys(text):
+    return set(re.findall(r'"(prefix\+[^"]+)"', text))
+
+
+def configure(custom_path=False):
+    print("Herdr config")
+    if not HERDR_CONFIG.exists():
+        HERDR_CONFIG.parent.mkdir(parents=True, exist_ok=True)
+        HERDR_CONFIG.write_text("")
+    old = HERDR_CONFIG.read_text()
+    defaults = output(["herdr", "--default-config"])[1]
+    additions = []
+
+    if re.search(r"(?m)^\s*\[ui\.sidebar\.spaces\]", old):
+        if "$ci" in old:
+            ok("sidebar tokens already configured")
+        else:
+            warn("you already have [ui.sidebar.spaces]; add these cells to one of its rows yourself:")
+            print("\n".join("      " + line for line in SIDEBAR_TOKENS.splitlines()))
+    else:
+        additions.append(sidebar_block())
+
+    if str(ROOT / "bin" / "orch-pick") in old:
+        ok("popup already bound")
+    elif POPUP_KEY in used_keys(old) or f'"{POPUP_KEY}"' in defaults:
+        warn(f"{POPUP_KEY} is taken; add this with a free key yourself:")
+        print("\n".join("      " + line for line in popup_block("prefix+<key>").splitlines()))
+    else:
+        additions.append(popup_block(POPUP_KEY))
+
+    if not additions:
+        return
+    backup = HERDR_CONFIG.with_name(f"config.toml.bak-orchestrator-{datetime.now():%Y%m%d-%H%M%S}")
+    shutil.copy(HERDR_CONFIG, backup)
+    HERDR_CONFIG.write_text((old.rstrip() + "\n\n" if old.strip() else "") + "\n".join(additions))
+    env = dict(os.environ, XDG_CONFIG_HOME=str(HERDR_CONFIG.parent.parent)) if custom_path else None
+    proc = subprocess.run(["herdr", "config", "check"], capture_output=True, text=True, env=env)
+    code, text = proc.returncode, (proc.stdout + proc.stderr).strip()
+    if code or "config: ok" not in text.lower():
+        shutil.copy(backup, HERDR_CONFIG)
+        fail(f"Herdr rejected the change, restored {HERDR_CONFIG.name}:\n{text}")
+        return
+    ok(f"updated {HERDR_CONFIG} (backup: {backup.name})")
+    if custom_path:
+        return
+    code, text = output(["herdr", "server", "reload-config"])
+    ok("reloaded the running Herdr server") if code == 0 else warn("reload with: herdr server reload-config")
+
+
+def herdr_json(*args):
+    code, text = output(["herdr", *args])
+    try:
+        return json.loads(text)["result"] if code == 0 else None
+    except (ValueError, KeyError):
+        return None
+
+
+def launch():
+    print("Workspace")
+    if os.environ.get("HERDR_ENV") != "1":
+        fail("run --launch from inside a Herdr pane")
+        return
+    existing = [w for w in (herdr_json("workspace", "list") or {}).get("workspaces", []) if w["label"] == "orchestrator"]
+    if existing:
+        ok(f"an orchestrator workspace exists already ({existing[0]['workspace_id']})")
+        return
+    created = herdr_json("workspace", "create", "--cwd", str(ROOT), "--label", "orchestrator", "--no-focus")
+    if not created:
+        fail("could not create the workspace")
+        return
+    root_pane = created["root_pane"]["pane_id"]
+    board = herdr_json("pane", "split", root_pane, "--direction", "right", "--cwd", str(ROOT), "--no-focus")
+    if board:
+        output(["herdr", "pane", "run", board["pane"]["pane_id"], "bin/orch-watch"])
+        ok("board running on the right")
+    code, text = output(["herdr", "agent", "start", "orchestrator", "--kind", "claude", "--pane", root_pane,
+                         "--timeout", "60000"])
+    if code == 0:
+        ok("Claude session 'orchestrator' started on the left")
+    else:
+        warn("Claude is waiting on its first-run questions (trust this folder); answer them in the left pane")
+    print(f"    switch to the orchestrator workspace, then type /status there")
+
+
+def main():
+    global HERDR_CONFIG
+    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    parser.add_argument("--config", action="store_true", help="add sidebar tokens and the popup to Herdr's config")
+    parser.add_argument("--launch", action="store_true", help="open the orchestrator workspace")
+    parser.add_argument("--herdr-config", type=Path, help=f"Herdr config.toml to edit (default {HERDR_CONFIG})")
+    args = parser.parse_args()
+    if args.herdr_config:
+        HERDR_CONFIG = args.herdr_config.expanduser().resolve()
+    good = check()
+    print()
+    local_files()
+    if not good:
+        print("\nFix the requirements above, then run bin/orch-setup again.")
+        sys.exit(1)
+    if args.config:
+        print()
+        configure(custom_path=bool(args.herdr_config))
+    if args.launch:
+        print()
+        launch()
+    if not (args.config or args.launch):
+        print("\nNext: bin/orch-setup --config --launch")
+
+
+if __name__ == "__main__":
+    main()

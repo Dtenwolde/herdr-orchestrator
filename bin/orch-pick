@@ -1,0 +1,173 @@
+#!/usr/bin/env python3
+"""Triage popup over the orchestrator board (Herdr prefix+t).
+
+enter   jump to the workspace (inbox items: open the link)
+ctrl-o  open the PR or issue in the browser
+ctrl-p  park / unpark
+ctrl-s  snooze (pick how long)
+ctrl-d  mark done until there is new activity
+
+Reads state/items.json and state/overrides.toml, so it opens instantly and never calls GitHub.
+"""
+import importlib.machinery
+import importlib.util
+import json
+import os
+import subprocess
+import sys
+import tempfile
+import webbrowser
+from datetime import date, timedelta
+from pathlib import Path
+
+HERE = Path(__file__).resolve().parent
+_loader = importlib.machinery.SourceFileLoader("herdr_status", str(HERE / "herdr-status"))
+_spec = importlib.util.spec_from_loader("herdr_status", _loader)
+hs = importlib.util.module_from_spec(_spec)
+_loader.exec_module(hs)
+hs.load_config()
+
+KEYS = ("ctrl-o", "ctrl-p", "ctrl-s", "ctrl-d")
+HEADER = "enter go · ctrl-o open link · ctrl-p park · ctrl-s snooze · ctrl-d done · esc close"
+
+
+def load_units():
+    if not hs.ITEMS_FILE.exists():
+        sys.exit("No board data yet (state/items.json); is bin/orch-watch running?")
+    units = json.loads(hs.ITEMS_FILE.read_text())["units"]
+    overrides, _ = hs.load_overrides()
+    hs.rank(units, overrides)
+    return [u for u in units if not (u.get("inbox") and u["priority"] == hs.QUIET)], overrides
+
+
+def target(unit):
+    """The overrides.toml table an action on this line edits."""
+    if unit.get("inbox"):
+        return "pr", unit["pr"]["key"]
+    return "workspace", unit["workspace"]
+
+
+def line(index, unit):
+    prio = "INBOX" if hs.in_inbox(unit) else hs.PRIO_NAMES[unit["priority"]]
+    color = "pink" if prio == "INBOX" else hs.PRIO_COLORS[unit["priority"]]
+    items = hs.visible_items(unit)
+    top = items[0] if items else None
+    icon, icon_color = hs.KIND_ICONS.get(top["kind"], ("-", "comment")) if top else (" ", None)
+    reason = hs.re.sub(r"\bagent w[0-9A-Za-z]+:p\d+ ", "agent ", hs.item_text(top)) if top else ""
+    more = f" +{len(items) - 1}" if len(items) > 1 else ""
+    label = hs.clip(unit["workspace"], 34)
+    text = (f"{hs.paint('●', color)} {hs.paint(f'{prio:<8}', color, bold=True)} {hs.paint(f'{label:<34}', bold=True)} "
+            f"{hs.paint(icon, icon_color, bold=True)} {hs.paint(reason, 'comment' if prio in ('QUIET', 'PARKED') else None)}"
+            f"{hs.paint(more, 'comment')}")
+    return f"{index}\t{text}"
+
+
+def preview(snapshot, index):
+    unit = json.loads(Path(snapshot).read_text())[int(index)]
+    overrides, _ = hs.load_overrides()
+    print(hs.paint(unit["workspace"], bold=True))
+    pr = unit.get("pr") or {}
+    if pr.get("title"):
+        print(pr["title"])
+    if pr.get("url"):
+        print(hs.paint(pr["url"], "comment"))
+    if unit.get("remotes"):
+        print(hs.paint("remote: " + ", ".join(unit["remotes"]), "pink"))
+    print()
+    for item in sorted(unit["items"], key=lambda i: (i["priority"] if i["priority"] is not None else 9)):
+        icon, icon_color = hs.KIND_ICONS.get(item["kind"], ("-", "comment"))
+        state = "" if item["state"] == "active" else f"  [{item['state']}]"
+        print(f"{hs.paint(icon, icon_color, bold=True)} {hs.item_text(item)}{hs.paint(state, 'comment')}")
+    for note in unit.get("notes", []):
+        print(hs.paint(f"» {note}", "comment", italic=True))
+    section, key = target(unit)
+    entry = overrides.get(section, {}).get(key)
+    if entry:
+        shown = {k: v for k, v in entry.items() if k not in ("snooze_until", "snooze_label")}
+        if "snooze_label" in entry:
+            shown["snooze_until"] = entry["snooze_label"]
+        print("\n" + hs.paint(f'[{section}."{key}"] {json.dumps(shown, default=str)}', "comment"))
+
+
+def choose_snooze():
+    today = date.today()
+    monday = today + timedelta(days=(7 - today.weekday()) or 7)
+    options = [("tomorrow", today + timedelta(days=1)), (f"Monday {monday:%d %b}", monday),
+               ("in 3 days", today + timedelta(days=3)), ("next week", today + timedelta(days=7)),
+               ("clear snooze", None)]
+    menu = "\n".join(f"{i}\t{label}" for i, (label, _) in enumerate(options))
+    picked = subprocess.run(["fzf", "--delimiter=\t", "--with-nth=2", "--layout=reverse", "--height=10",
+                             "--border", "--prompt=snooze until > "], input=menu, capture_output=True, text=True)
+    if picked.returncode != 0 or not picked.stdout.strip():
+        return False, None
+    return True, options[int(picked.stdout.split("\t", 1)[0])][1]
+
+
+def act(key, unit):
+    """Run one action; returns a status line to show when the list reopens, or None to close the popup."""
+    section, name = target(unit)
+    url = (unit.get("pr") or {}).get("url")
+    if key == "ctrl-o" or (not key and unit.get("inbox")):
+        if url:
+            webbrowser.open(url)
+        return None
+    if not key:
+        if unit.get("machine_id"):
+            cmd = ["herdr", "--machine", unit["machine_id"], "workspace", "focus", unit["workspace_id"]]
+        else:
+            cmd = ["herdr", "workspace", "focus", unit["workspace_id"]]
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        return None if result.returncode == 0 else f"could not jump to {unit['workspace']}: {result.stderr.strip()[:80]}"
+    overrides, _ = hs.load_overrides()
+    entry = overrides.get(section, {}).get(name) or {}
+    if key == "ctrl-p":
+        parked = not entry.get("parked")
+        hs.set_override(section, name, "parked", True if parked else None)
+        return f"{'parked' if parked else 'unparked'} {name}"
+    if key == "ctrl-s":
+        chosen, until = choose_snooze()
+        if not chosen:
+            return ""
+        hs.set_override(section, name, "snooze_until", until)
+        return f"snoozed {name} until {until}" if until else f"snooze cleared for {name}"
+    if key == "ctrl-d":
+        hs.set_override(section, name, "done", date.today())
+        return f"{name} marked done until there is new activity"
+    return ""
+
+
+def main():
+    if len(sys.argv) == 4 and sys.argv[1] == "--preview":
+        preview(sys.argv[2], sys.argv[3])
+        return
+    status = ""
+    with tempfile.TemporaryDirectory() as tmp:
+        snapshot = Path(tmp) / "units.json"
+        while True:
+            units, _ = load_units()
+            snapshot.write_text(json.dumps(units, default=str))
+            listing = "\n".join(line(i, u) for i, u in enumerate(units))
+            header = HEADER + (f"\n{status}" if status else "")
+            picked = subprocess.run(
+                ["fzf", "--ansi", "--delimiter=\t", "--with-nth=2", "--no-sort", "--layout=reverse",
+                 "--border", "--info=inline", "--prompt=board > ", f"--header={header}",
+                 f"--expect={','.join(KEYS)}",
+                 f"--preview={sys.executable} {HERE / 'orch-pick'} --preview {snapshot} {{1}}",
+                 "--preview-window=down,45%,wrap"],
+                input=listing, capture_output=True, text=True, env=dict(os.environ, ORCH_COLOR="1"))
+            if picked.returncode != 0:
+                return
+            key, _, chosen = picked.stdout.partition("\n")
+            if not chosen.strip():
+                return
+            unit = units[int(chosen.split("\t", 1)[0])]
+            try:
+                status = act(key.strip(), unit)
+            except ValueError as error:
+                status = str(error)
+            if status is None:
+                return
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,1762 @@
+#!/usr/bin/env python3
+"""Status of every Herdr workspace (agents, git, GitHub PRs), ranked by what needs attention.
+
+Read-only towards the workspaces: it only reads Herdr/git/GitHub state. The --sidebar and
+--kind flags write display-only Herdr metadata, --notify shows Herdr notifications.
+
+Every full run writes the raw ranked items to state/items.json. state/overrides.toml (parked,
+snooze_until, ignore_question, note per workspace or PR) is applied when ranking, both for the
+board and for --todo, which renders TODO.md from state/items.json and keeps its Notes section.
+"""
+from __future__ import annotations
+
+import argparse
+import concurrent.futures as cf
+import json
+import os
+import re
+import shlex
+import subprocess
+import sys
+import textwrap
+import threading
+import time
+from datetime import date, datetime, timedelta
+from pathlib import Path
+
+HOME = Path.home()
+ROOT = Path(__file__).resolve().parent.parent
+STATE_DIR = ROOT / "state"
+STATE_FILE = STATE_DIR / "last.json"
+ITEMS_FILE = STATE_DIR / "items.json"
+OVERRIDES_FILE = STATE_DIR / "overrides.toml"
+TODO_FILE = ROOT / "TODO.md"
+TODO_STATE = STATE_DIR / "todo.json"
+PROJECTS = HOME / ".claude" / "projects"
+CONFIG_FILE = ROOT / "orchestrator.toml"
+CONFIG_DEFAULTS = {
+    "worktree_root": None,  # where your worktrees live; only used to infer r/b/f kind tags
+    "base_branches": r"^(main|master|develop|trunk|v\d+\.\d+.*)$",  # branches that never have their own PR
+    "bots": [],  # extra GitHub logins whose comments never count as feedback
+    "kind_tags": False,  # restore r/b/f workspace kind tags (sidebar token $kind)
+    "watch": {"interval": 60, "briefing_at": "09:00", "what_moved_at": "18:00", "agent": "orchestrator"},
+}
+WORKTREE_ROOT = None
+BASE_BRANCH_RE = re.compile(CONFIG_DEFAULTS["base_branches"])
+BOTS = {"github-actions", "codecov", "dependabot", "copilot-pull-request-reviewer"}
+NOW, SOON, RUNNING, WAITING, CLEANUP, QUIET, PARKED = range(7)
+PRIO_NAMES = {NOW: "NOW", SOON: "SOON", RUNNING: "RUNNING", WAITING: "WAITING", CLEANUP: "CLEANUP", QUIET: "QUIET",
+              PARKED: "PARKED"}
+HIDDEN_KINDS = ("nothing", "no-pr")
+# Kinds that come and go on their own; they never count as done or new in TODO.md and the briefings.
+TRANSIENT_KINDS = {"ci-running", "agent-working", "agent-done", "agent-blocked", "agent-question", "reviewing",
+                   "nothing", "no-pr", "merge-queued"}
+BRIEFINGS = ROOT / "briefings"
+CACHE_FILE = STATE_DIR / "cache.json"
+HISTORY_FILE = STATE_DIR / "history.jsonl"
+REMOTE_TTL = 120
+INBOX_TTL = 300
+TOKEN_SOURCE = "custom:orch"
+TOKENS = ("ci", "pr", "fb")
+
+LIST_FIELDS = (
+    "number,title,state,isDraft,url,author,headRefName,headRepositoryOwner,"
+    "reviewDecision,statusCheckRollup,updatedAt,mergedAt,body"
+)
+REF_URL = re.compile(r"github\.com/([\w.-]+/[\w.-]+)/(?:issues|pull)/(\d+)")
+REF_KEY = re.compile(r"(?<![\w/])([\w.-]+/[\w.-]+)#(\d+)")
+DETAIL_QUERY = """
+query($o: String!, $r: String!, $n: Int!) {
+  repository(owner: $o, name: $r) {
+    pullRequest(number: $n) {
+      reviewThreads(first: 100) { nodes { isResolved comments(last: 1) { nodes { author { login } createdAt } } } }
+      reviews(last: 40) { nodes { author { login } state submittedAt body } }
+      comments(last: 40) { nodes { author { login } createdAt } }
+      commits(last: 1) { nodes { commit { committedDate } } }
+      reviewRequests(first: 20) { nodes { requestedReviewer { ... on User { login } } } }
+      mergeQueueEntry { state position enqueuedAt estimatedTimeToMerge }
+      timelineItems(last: 5, itemTypes: [ADDED_TO_MERGE_QUEUE_EVENT, REMOVED_FROM_MERGE_QUEUE_EVENT]) {
+        nodes {
+          __typename
+          ... on AddedToMergeQueueEvent { createdAt }
+          ... on RemovedFromMergeQueueEvent { createdAt reason actor { login } }
+        }
+      }
+    }
+  }
+}
+"""
+
+
+def run(cmd, cwd=None, timeout=60):
+    try:
+        proc = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True, timeout=timeout)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    return proc.stdout if proc.returncode == 0 else None
+
+
+def herdr(*args):
+    out = run(["herdr", *args])
+    try:
+        return json.loads(out)["result"] if out else None
+    except (ValueError, KeyError):
+        return None
+
+
+def parse_ts(value):
+    if not value:
+        return None
+    try:
+        return datetime.fromisoformat(value.replace("Z", "+00:00")).timestamp()
+    except ValueError:
+        return None
+
+
+def ago(t):
+    if not t:
+        return "?"
+    delta = time.time() - t
+    for unit, seconds in (("d", 86400), ("h", 3600), ("m", 60)):
+        if delta >= seconds:
+            return f"{int(delta // seconds)}{unit}"
+    return "now"
+
+
+# ---------------------------------------------------------------- transcripts
+
+
+def transcript_info(session_id=None, cwd=None):
+    if session_id:
+        direct = PROJECTS / re.sub(r"[^A-Za-z0-9]", "-", cwd or "") / f"{session_id}.jsonl"
+        hits = [direct] if cwd and direct.exists() else list(PROJECTS.glob(f"*/{session_id}.jsonl"))
+    elif cwd:
+        hits = list((PROJECTS / re.sub(r"[^A-Za-z0-9]", "-", cwd)).glob("*.jsonl"))
+    else:
+        hits = []
+    if not hits:
+        return {}
+    path = max(hits, key=lambda p: p.stat().st_mtime)
+    size = path.stat().st_size
+    with path.open("rb") as f:
+        f.seek(max(0, size - 400_000))
+        lines = f.read().decode("utf-8", "replace").splitlines()
+    info = {"transcript": str(path)}
+    for line in reversed(lines):
+        try:
+            entry = json.loads(line)
+        except ValueError:
+            continue
+        kind = entry.get("type")
+        if "last_activity" not in info and kind in ("assistant", "user") and entry.get("timestamp"):
+            info["last_activity"] = parse_ts(entry["timestamp"])
+        if kind == "last-prompt" and "last_prompt" not in info:
+            info["last_prompt"] = (entry.get("lastPrompt") or "")[:300]
+        elif kind == "system" and entry.get("subtype") == "away_summary" and "summary" not in info:
+            info["summary"] = (entry.get("content") or "")[:600]
+            info["summary_at"] = parse_ts(entry.get("timestamp"))
+        elif kind == "assistant" and "last_reply" not in info:
+            content = (entry.get("message") or {}).get("content")
+            if isinstance(content, list):
+                texts = [c.get("text", "") for c in content if c.get("type") == "text" and c.get("text")]
+                if texts:
+                    info["last_reply"] = texts[-1].strip()[-600:]
+                    info["last_reply_at"] = parse_ts(entry.get("timestamp"))
+        if all(k in info for k in ("last_activity", "last_prompt", "summary", "last_reply")):
+            break
+    # A recap older than the last reply describes an earlier state of the session.
+    if info.get("summary_at") and info.get("last_reply_at") and info["summary_at"] < info["last_reply_at"]:
+        info.pop("summary", None)
+    return info
+
+
+# ------------------------------------------------------------------------ git
+
+
+def git_toplevel(path):
+    out = run(["git", "-C", path, "rev-parse", "--show-toplevel"])
+    return out.strip() if out else None
+
+
+def git_info(path):
+    out = run(["git", "-C", path, "status", "--porcelain=v2", "--branch"])
+    if out is None:
+        return None
+    info = {"dirty": 0, "untracked": 0}
+    for line in out.splitlines():
+        if line.startswith("# branch.head "):
+            info["branch"] = line.split(" ", 2)[2]
+        elif line.startswith("# branch.upstream "):
+            info["upstream"] = line.split(" ", 2)[2]
+        elif line.startswith("# branch.ab "):
+            ahead, behind = line.split()[2:4]
+            info["ahead"], info["behind"] = int(ahead), -int(behind)
+        elif line.startswith("?"):
+            info["untracked"] += 1
+        elif line[:1] in ("1", "2", "u"):
+            info["dirty"] += 1
+    info["remotes"] = {}
+    for line in (run(["git", "-C", path, "remote", "-v"]) or "").splitlines():
+        match = re.match(r"(\S+)\s+\S*github\.com[:/]([^/\s]+)/([^\s]+?)(?:\.git)?\s+\(fetch\)", line)
+        if match:
+            info["remotes"][match[1]] = f"{match[2]}/{match[3]}"
+    log = run(["git", "-C", path, "log", "-1", "--format=%ct%x00%s"])
+    if log and "\0" in log:
+        commit_time, subject = log.strip().split("\0", 1)
+        info["last_commit"] = int(commit_time)
+        info["last_commit_msg"] = subject[:100]
+    return info
+
+
+def remote_owner(git, remote):
+    repo = (git.get("remotes") or {}).get(remote)
+    return repo.split("/", 1)[0] if repo else None
+
+
+def base_repo(git):
+    remotes = git.get("remotes") or {}
+    return remotes.get("upstream") or remotes.get("origin")
+
+
+def is_base_branch(branch):
+    return branch == "(detached)" or bool(BASE_BRANCH_RE.match(branch))
+
+
+def load_config():
+    """Optional orchestrator.toml next to bin/ (see orchestrator.example.toml); returns (config, warnings)."""
+    import tomllib  # local only; the remote probe runs on older Pythons
+
+    global WORKTREE_ROOT, BASE_BRANCH_RE
+    config = json.loads(json.dumps(CONFIG_DEFAULTS))
+    warnings = []
+    if CONFIG_FILE.exists():
+        try:
+            data = tomllib.loads(CONFIG_FILE.read_text())
+        except (tomllib.TOMLDecodeError, OSError) as error:
+            data = {}
+            warnings.append(f"{CONFIG_FILE.name} ignored: {error}")
+        for key, value in data.items():
+            if key == "watch" and isinstance(value, dict):
+                config["watch"].update(value)
+            elif key in config:
+                config[key] = value
+            else:
+                warnings.append(f'{CONFIG_FILE.name}: unknown setting "{key}"')
+    WORKTREE_ROOT = Path(config["worktree_root"]).expanduser() if config["worktree_root"] else None
+    try:
+        BASE_BRANCH_RE = re.compile(config["base_branches"])
+    except re.error as error:
+        warnings.append(f"{CONFIG_FILE.name}: base_branches is not a valid regex ({error})")
+    BOTS.update(config["bots"])
+    return config, warnings
+
+
+# --------------------------------------------------------------------- GitHub
+
+
+def find_pr(path, git, local=True):
+    if local:
+        where = {"cwd": path}
+        repo_args = []
+    else:
+        if not base_repo(git):
+            return None
+        where = {}
+        repo_args = ["--repo", base_repo(git)]
+    match = re.search(r"/pr/(\d+)(/|$)", path)
+    if match:
+        out = run(["gh", "pr", "view", match.group(1), "--json", LIST_FIELDS, *repo_args], **where)
+        if out is None:
+            raise GhError(f"pr view {match.group(1)}")
+        return json.loads(out)
+    branch = git.get("branch")
+    if not branch or is_base_branch(branch):
+        return None
+    remote = (git.get("upstream") or "origin/").split("/", 1)[0]
+    owner = remote_owner(git, remote) or remote_owner(git, "origin")
+    out = run(["gh", "pr", "list", "--head", branch, "--state", "all", "--limit", "10", "--json", LIST_FIELDS,
+               *repo_args], **where)
+    if out is None:
+        raise GhError(f"pr list {branch}")
+    prs = json.loads(out)
+    if owner:
+        prs = [p for p in prs if ((p.get("headRepositoryOwner") or {}).get("login") or "").lower() == owner.lower()]
+    prs.sort(key=lambda p: (p["state"] != "OPEN", -(parse_ts(p.get("updatedAt")) or 0)))
+    return prs[0] if prs else None
+
+
+def refs_in(text, repo=None):
+    text = text or ""
+    keys = {f"{m[1]}#{m[2]}" for pattern in (REF_URL, REF_KEY) for m in pattern.finditer(text)}
+    if repo:
+        keys |= {f"{repo}#{m[1]}" for m in re.finditer(r"(?<![\w/#])#(\d+)\b", text)}
+    return sorted(keys)
+
+
+def normalize_ref(value):
+    value = (value or "").strip()
+    match = REF_URL.search(value) or re.fullmatch(r"([\w.-]+/[\w.-]+)#(\d+)", value)
+    return f"{match[1]}#{match[2]}" if match else None
+
+
+def pr_key(url):
+    match = re.match(r"https://github\.com/([^/]+/[^/]+)/pull/(\d+)", url or "")
+    return f"{match[1]}#{match[2]}" if match else None
+
+
+def ci_summary(rollup):
+    failed, pending, passed, started = [], 0, 0, []
+    for check in rollup or []:
+        started_at = parse_ts(check.get("startedAt"))
+        if started_at and started_at > 1e9:
+            started.append(started_at)
+        if "conclusion" not in check and "state" in check:
+            state = check.get("state")
+            if state in ("FAILURE", "ERROR"):
+                failed.append(check.get("context"))
+            elif state in ("PENDING", "EXPECTED"):
+                pending += 1
+            else:
+                passed += 1
+        elif check.get("status") != "COMPLETED":
+            pending += 1
+        elif check.get("conclusion") in ("FAILURE", "TIMED_OUT", "STARTUP_FAILURE", "ACTION_REQUIRED"):
+            failed.append(check.get("name"))
+        else:
+            passed += 1
+    state = "fail" if failed else "pending" if pending else "pass" if passed else None
+    return {"state": state, "failed": failed[:8], "failed_count": len(failed), "pending": pending, "passed": passed,
+            "total": len(rollup or []), "started_at": min(started, default=None)}
+
+
+def is_human(login, me):
+    return bool(login) and login != me and not login.endswith("[bot]") and login not in BOTS
+
+
+def pr_detail(pr, me):
+    match = re.match(r"https://github\.com/([^/]+)/([^/]+)/pull/(\d+)", pr.get("url", ""))
+    if not match:
+        return {}
+    out = run(["gh", "api", "graphql", "-f", f"query={DETAIL_QUERY}", "-f", f"o={match[1]}", "-f", f"r={match[2]}",
+               "-F", f"n={match[3]}"])
+    if out is None:
+        raise GhError(f"graphql {match[3]}")
+    try:
+        data = json.loads(out)["data"]["repository"]["pullRequest"]
+    except (TypeError, ValueError, KeyError):
+        return {}
+    threads = data["reviewThreads"]["nodes"]
+    external, mine = [], []
+    for thread in threads:
+        for c in thread["comments"]["nodes"]:
+            login = (c.get("author") or {}).get("login")
+            (mine if login == me else external if is_human(login, me) else []).append(
+                (parse_ts(c["createdAt"]), login))
+    for review in data["reviews"]["nodes"]:
+        login = (review.get("author") or {}).get("login")
+        silent_approval = review.get("state") == "APPROVED" and not (review.get("body") or "").strip()
+        if review.get("submittedAt") and review.get("state") != "PENDING" and not silent_approval:
+            (mine if login == me else external if is_human(login, me) else []).append(
+                (parse_ts(review["submittedAt"]), login))
+    for c in data["comments"]["nodes"]:
+        login = (c.get("author") or {}).get("login")
+        (mine if login == me else external if is_human(login, me) else []).append((parse_ts(c["createdAt"]), login))
+    commits = data["commits"]["nodes"]
+    last_commit = parse_ts(commits[-1]["commit"]["committedDate"]) if commits else None
+    my_reviews = [parse_ts(r["submittedAt"]) for r in data["reviews"]["nodes"]
+                  if (r.get("author") or {}).get("login") == me and r.get("submittedAt")]
+    requested = [((n.get("requestedReviewer") or {}).get("login")) for n in data["reviewRequests"]["nodes"]]
+    last_external = max(external, default=(None, None))
+    entry = data.get("mergeQueueEntry")
+    merge_queue = {"state": entry.get("state"), "position": entry.get("position"),
+                   "enqueued_at": parse_ts(entry.get("enqueuedAt")),
+                   "eta": entry.get("estimatedTimeToMerge")} if entry else None
+    queue_events = ((data.get("timelineItems") or {}).get("nodes")) or []
+    last_queue_event = queue_events[-1] if queue_events else {}
+    dequeued = None
+    if not entry and last_queue_event.get("__typename") == "RemovedFromMergeQueueEvent":
+        dequeued = {"at": parse_ts(last_queue_event.get("createdAt")), "reason": last_queue_event.get("reason"),
+                    "by": (last_queue_event.get("actor") or {}).get("login")}
+    return {
+        "merge_queue": merge_queue,
+        "dequeued": dequeued,
+        "unresolved_threads": sum(1 for t in threads if not t["isResolved"]),
+        "last_external_at": last_external[0],
+        "last_external_by": last_external[1],
+        "my_last_at": max([t for t, _ in mine if t], default=None),
+        "last_pr_commit": last_commit,
+        "my_last_review": max([t for t in my_reviews if t], default=None),
+        "review_requested_from_me": me in requested,
+    }
+
+
+# ------------------------------------------------------------------ collection
+
+
+def collect_units(workspaces, agents, panes, exclude=None, toplevel=git_toplevel):
+    """One unit per (workspace, git checkout); non-git workspaces get one unit for their directory."""
+    agents_by_ws, panes_by_ws = {}, {}
+    for agent in agents:
+        agents_by_ws.setdefault(agent["workspace_id"], []).append(agent)
+    for pane in panes:
+        panes_by_ws.setdefault(pane["workspace_id"], []).append(pane)
+    units = []
+    for ws in workspaces:
+        ws_id = ws["workspace_id"]
+        candidates = []
+        if ws.get("worktree"):
+            candidates.append(ws["worktree"]["checkout_path"])
+        candidates += [a.get("cwd") for a in agents_by_ws.get(ws_id, [])]
+        if not candidates:
+            candidates += [p.get("cwd") for p in panes_by_ws.get(ws_id, [])]
+        paths = []
+        for cwd in filter(None, candidates):
+            top = toplevel(cwd) or cwd
+            if top not in paths:
+                paths.append(top)
+        if exclude and any(Path(p).resolve() == exclude or exclude in Path(p).resolve().parents for p in paths):
+            continue
+        for path in paths or [None]:
+            ws_agents = [a for a in agents_by_ws.get(ws_id, [])
+                         if path is None or len(paths) == 1 or (a.get("cwd") or "").startswith(path)]
+            units.append({"workspace_id": ws_id, "workspace": ws["label"], "path": path,
+                          "tokens": ws.get("tokens") or {}, "linked_worktree": bool(ws.get("worktree")),
+                          "agents": ws_agents})
+    return units
+
+
+def enrich_local(unit):
+    agents = []
+    for agent in unit.pop("agents"):
+        info = agent_info(agent)
+        session = (agent.get("agent_session") or {}).get("value")
+        if agent.get("agent") == "claude":
+            info.update(transcript_info(session_id=session, cwd=agent.get("cwd")) if session
+                        else transcript_info(cwd=agent.get("cwd")))
+        agents.append(info)
+    unit["agents"] = agents
+    unit["git"] = git_info(unit["path"]) if unit["path"] else None
+    return unit
+
+
+def agent_info(agent):
+    return {"target": agent.get("name") or agent["pane_id"], "pane_id": agent["pane_id"],
+            "status": agent.get("agent_status"), "title": agent.get("terminal_title_stripped"),
+            "kind": agent.get("agent"), "cwd": agent.get("cwd")}
+
+
+def enrich_github(unit, me, cache):
+    """PR state through the cache; the git signature invalidates it after a commit or push."""
+    git = unit["git"]
+    if git and not unit.get("linked_to"):
+        key = f"gh:{unit.get('machine') or 'local'}:{unit['path']}"
+        signature = [git.get("branch"), git.get("last_commit"), git.get("ahead")]
+        hit, value = cache.get(key, pr_ttl, signature)
+        if not hit:
+            try:
+                value = fetch_pr(unit, me)
+                cache.put(key, value, signature)
+            except (GhError, ValueError):
+                value = cache.stale(key)
+        if value:
+            unit["pr"] = value
+    classify(unit, me)
+    return unit
+
+
+def fetch_pr(unit, me):
+    pr = find_pr(unit["path"], unit["git"], local=not unit.get("machine"))
+    if not pr:
+        return None
+    value = {
+        "key": pr_key(pr["url"]), "number": pr["number"], "title": pr["title"], "url": pr["url"],
+        "state": pr["state"], "draft": pr.get("isDraft"), "author": (pr.get("author") or {}).get("login"),
+        "review_decision": pr.get("reviewDecision") or None, "ci": ci_summary(pr.get("statusCheckRollup")),
+    }
+    key = value["key"] or ""
+    value["refs"] = [ref for ref in refs_in(pr.get("body"), key.split("#")[0] or None) if ref != key]
+    if pr["state"] == "OPEN":
+        value.update(pr_detail(pr, me))
+    return value
+
+
+# ------------------------------------------------------------ remote machines
+
+
+def probe(request):
+    """Runs on a remote host (python3 >= 3.9): git state and Claude transcripts for the given directories."""
+    result = {"toplevel": {}, "git": {}, "transcripts": {}}
+    for cwd in request.get("git", []):
+        top = git_toplevel(cwd)
+        result["toplevel"][cwd] = top
+        if top and top not in result["git"]:
+            result["git"][top] = git_info(top)
+    for cwd in request.get("transcripts", []):
+        result["transcripts"][cwd] = transcript_info(cwd=cwd)
+    return result
+
+
+def ssh_probe(host, request):
+    command = "python3 - --probe " + shlex.quote(json.dumps(request))
+    try:
+        proc = subprocess.run(["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", host, command],
+                              input=Path(__file__).read_text(), capture_output=True, text=True, timeout=90)
+        return json.loads(proc.stdout) if proc.returncode == 0 else None
+    except (OSError, subprocess.TimeoutExpired, ValueError):
+        return None
+
+
+def machines():
+    out = run(["herdr", "machine", "list", "--json"])
+    try:
+        return [m for m in json.loads(out) if m.get("enabled")] if out else []
+    except ValueError:
+        return []
+
+
+def remote_units(machine):
+    selector, host = machine["id"], machine.get("target") or machine["label"]
+    workspaces = (herdr("--machine", selector, "workspace", "list") or {}).get("workspaces")
+    if workspaces is None:
+        return [], f"{host}: Herdr server not reachable (ssh auth expired?)"
+    agents = (herdr("--machine", selector, "agent", "list") or {}).get("agents", [])
+    panes = (herdr("--machine", selector, "pane", "list") or {}).get("panes", [])
+    cwds = {a.get("cwd") for a in agents} | {p.get("cwd") for p in panes}
+    cwds |= {(w.get("worktree") or {}).get("checkout_path") for w in workspaces}
+    claude_cwds = {a.get("cwd") for a in agents if a.get("agent") == "claude"}
+    result = ssh_probe(host, {"git": sorted(filter(None, cwds)), "transcripts": sorted(filter(None, claude_cwds))})
+    warning = None
+    if result is None:
+        result = {"toplevel": {}, "git": {}, "transcripts": {}}
+        warning = f"{host}: ssh failed, showing Herdr state only"
+    units = collect_units(workspaces, agents, panes, toplevel=lambda cwd: result["toplevel"].get(cwd))
+    for unit in units:
+        unit.update(machine=host, machine_id=selector, workspace=f"{host}:{unit['workspace']}", tokens={})
+        unit["agents"] = [dict(agent_info(a), **(result["transcripts"].get(a.get("cwd")) or {}))
+                          for a in unit["agents"]]
+        unit["git"] = result["git"].get(unit["path"]) if unit["path"] else None
+    return units, warning
+
+
+def link_remotes(local, remote):
+    """A remote checkout on the same branch of the same repository belongs to the local workspace."""
+    for unit in remote:
+        git = unit.get("git") or {}
+        branch = git.get("branch")
+        if not branch or is_base_branch(branch):
+            continue
+        repos = set((git.get("remotes") or {}).values())
+        for parent in local:
+            parent_git = parent.get("git") or {}
+            if parent_git.get("branch") == branch and repos & set((parent_git.get("remotes") or {}).values()):
+                unit["linked_to"] = parent["workspace"]
+                unit["link_key"] = [parent["workspace_id"], parent["path"]]
+                break
+
+
+def attach_remotes(units):
+    """Fold linked remote units into their local workspace; their items keep their own ids."""
+    parents = {(u["workspace_id"], u["path"]): u for u in units if not u.get("machine")}
+    top = []
+    for unit in units:
+        key = unit.pop("link_key", None)
+        parent = parents.get(tuple(key)) if key else None
+        if parent is None:
+            top.append(unit)
+            continue
+        parent.setdefault("remotes", []).append(unit)
+        for item in unit.pop("items"):
+            if item["base_priority"] < QUIET or item["kind"].startswith("agent"):
+                parent["items"].append(dict(item, text=f"{unit['machine']}: {item['text']}", source=unit["workspace"]))
+    for unit in top:
+        unit["active_at"] = last_activity(unit)
+    return top
+
+
+def classify(unit, me):
+    """Raw items for a unit: one per reason, each with a stable id `<subject>:<kind>`."""
+    items = []
+    pr = unit.get("pr")
+    git = unit.get("git") or {}
+
+    def add(prio, kind, text, alert=None, on_pr=False):
+        subject = f"pr:{pr['key']}" if on_pr and pr and pr.get("key") else f"ws:{unit['workspace']}"
+        item_id = f"{subject}:{kind}"
+        clashes = sum(1 for i in items if i["id"] == item_id or i["id"].startswith(item_id + "~"))
+        if clashes:
+            item_id += f"~{clashes + 1}"
+        alert_key = None if alert is None else item_id if alert is True else f"{item_id}@{alert}"
+        items.append({"id": item_id, "kind": kind, "base_priority": prio, "text": text, "alert": alert_key})
+
+    for agent in unit["agents"]:
+        status, target = agent["status"], agent["target"]
+        if status == "blocked":
+            add(NOW, "agent-blocked", f"agent {target} is waiting on an approval/question")
+        elif status == "done":
+            add(SOON, "agent-done", f"agent {target} finished, not looked at yet")
+        elif status == "working":
+            add(RUNNING, "agent-working", f"agent {target} working" + (f": {agent['title']}" if agent.get("title") else ""))
+        elif status == "idle" and (agent.get("last_reply") or "").rstrip().endswith("?"):
+            if time.time() - (agent.get("last_reply_at") or 0) < 2 * 86400:
+                add(WAITING, "agent-question", f"agent {target} ended with a question")
+
+    if pr:
+        n = pr["number"]
+        if pr["state"] == "MERGED":
+            add(CLEANUP, "pr-merged", f"PR #{n} merged: worktree can be cleaned up", True, on_pr=True)
+        elif pr["state"] == "CLOSED":
+            add(CLEANUP, "pr-closed", f"PR #{n} closed: worktree can be cleaned up", on_pr=True)
+        elif pr.get("author") == me:
+            ci = pr["ci"]
+            queue = pr.get("merge_queue")
+            dequeued = pr.get("dequeued")
+            if queue and queue.get("state") == "UNMERGEABLE":
+                add(NOW, "merge-queue-failed", f"#{n} cannot merge from the queue", True, on_pr=True)
+            elif queue:
+                add(RUNNING, "merge-queued", merge_queue_text(queue), on_pr=True)
+            elif (dequeued and dequeued.get("by") != me
+                  and (dequeued.get("at") or 0) > (pr.get("last_pr_commit") or 0)):
+                reason = (dequeued.get("reason") or "").replace("_", " ").lower()
+                add(NOW, "dequeued", f"#{n} was removed from the merge queue" + (f" ({reason})" if reason else ""),
+                    dequeued.get("at") or True, on_pr=True)
+            if ci["state"] == "fail":
+                failed = ", ".join(filter(None, ci["failed"][:3]))
+                add(NOW, "ci-failing", f"CI failing on #{n} ({ci['failed_count']}: {failed})",
+                    pr.get("last_pr_commit") or True, on_pr=True)
+            if pr.get("review_decision") == "CHANGES_REQUESTED":
+                add(SOON, "changes-requested", f"changes requested on #{n}", on_pr=True)
+            last_ext = pr.get("last_external_at")
+            my_last = max(filter(None, [pr.get("my_last_at"), pr.get("last_pr_commit")]), default=None)
+            if queue and last_ext and last_ext <= (queue.get("enqueued_at") or 0) + 300:
+                last_ext = None  # The "thanks" that comes with queueing the PR is not feedback.
+            if last_ext and (not my_last or last_ext > my_last):
+                add(SOON, "feedback", f"new feedback on #{n} from {pr.get('last_external_by')} ({ago(last_ext)} ago)",
+                    last_ext, on_pr=True)
+            elif pr.get("unresolved_threads"):
+                add(WAITING, "unresolved-threads", f"{pr['unresolved_threads']} unresolved review threads on #{n}",
+                    on_pr=True)
+            if queue:
+                pass  # Queued: approval and reviewers are settled.
+            elif pr.get("review_decision") == "APPROVED" and ci["state"] == "pass":
+                add(SOON, "approved-green", f"#{n} approved and green", on_pr=True)
+            elif ci["state"] == "pending":
+                add(RUNNING, "ci-running", ci_running_text(n, ci), on_pr=True)
+            elif all(i["base_priority"] >= RUNNING for i in items):
+                add(WAITING, "awaiting-review", f"#{n} waiting on review" + (" (draft)" if pr.get("draft") else ""),
+                    on_pr=True)
+        else:
+            if pr.get("my_last_review") and pr.get("last_pr_commit") and pr["last_pr_commit"] > pr["my_last_review"]:
+                add(SOON, "rereview", f"new commits on #{n} since your review", pr["last_pr_commit"], on_pr=True)
+            elif pr.get("review_requested_from_me") and not pr.get("my_last_review"):
+                add(SOON, "review-requested", f"your review is requested on #{n}", True, on_pr=True)
+            elif pr.get("last_external_at") and pr.get("my_last_at") and pr["last_external_at"] > pr["my_last_at"]:
+                add(WAITING, "discussion", f"new discussion on #{n} since your last comment", on_pr=True)
+            else:
+                queued = " (in the merge queue)" if pr.get("merge_queue") else ""
+                add(QUIET, "reviewing", f"reviewing #{n}, nothing new{queued}", on_pr=True)
+        if pr["state"] == "OPEN" and git.get("ahead"):
+            add(WAITING, "unpushed", f"{git['ahead']} local commits not pushed")
+    elif git and unit.get("machine") and git.get("ahead"):
+        add(WAITING, "unpushed", f"{git['ahead']} commits not pushed")
+    elif git:
+        last = max(filter(None, [git.get("last_commit")] + [a.get("last_activity") for a in unit["agents"]]),
+                   default=None)
+        if git.get("dirty") and last and time.time() - last > 3 * 86400:
+            add(WAITING, "stale-changes", f"{git['dirty']} uncommitted changes, untouched for {ago(last)}")
+        elif git.get("branch") and not is_base_branch(git["branch"]) and unit["linked_worktree"]:
+            add(QUIET, "no-pr", "no PR yet")
+    if not items:
+        add(QUIET, "nothing", "nothing pending")
+    unit["items"] = items
+
+
+def merge_queue_text(queue):
+    text = "in the merge queue"
+    if queue.get("position"):
+        text += f" · position {queue['position']}"
+    if queue.get("eta"):
+        text += f" · ~{max(int(queue['eta']) // 60, 1)}m to merge"
+    if queue.get("state") not in (None, "QUEUED"):
+        text += f" · {queue['state'].replace('_', ' ').lower()}"
+    return text
+
+
+def ci_running_text(number, ci):
+    text = f"CI running on #{number}"
+    if ci.get("total"):
+        text += f" · {ci['total'] - ci['pending']}/{ci['total']} checks done"
+    if ci.get("started_at"):
+        text += f" · {ago(ci['started_at'])}"
+    return text
+
+
+# ---------------------------------------------------------------------- inbox
+
+
+THREAD_FIELDS = "comments(last: 15) { nodes { author { login } createdAt } }"
+
+
+def thread_activity(keys, me):
+    """Per issue/PR key: your latest comment or review, and the latest one by someone else."""
+    activity = {}
+    keys = sorted(keys)
+    for start in range(0, len(keys), 20):
+        chunk = keys[start:start + 20]
+        parts = []
+        for i, key in enumerate(chunk):
+            repo, number = key.split("#")
+            owner, name = repo.split("/")
+            parts.append(f"t{i}: repository(owner: {json.dumps(owner)}, name: {json.dumps(name)}) "
+                         f"{{ issueOrPullRequest(number: {int(number)}) {{ ... on Issue {{ {THREAD_FIELDS} }} "
+                         f"... on PullRequest {{ {THREAD_FIELDS} reviews(last: 15) {{ nodes {{ author {{ login }} "
+                         f"createdAt: submittedAt }} }} }} }} }}")
+        try:
+            proc = subprocess.run(["gh", "api", "graphql", "-f", "query={ " + " ".join(parts) + " }"],
+                                  capture_output=True, text=True, timeout=60)
+            data = json.loads(proc.stdout or "{}").get("data") or {}  # partial data when a repo is inaccessible
+        except (OSError, subprocess.TimeoutExpired, ValueError):
+            raise GhError("thread activity")
+        for i, key in enumerate(chunk):
+            node = (data.get(f"t{i}") or {}).get("issueOrPullRequest") or {}
+            events = []
+            for field in ("comments", "reviews"):
+                for entry in (node.get(field) or {}).get("nodes", []):
+                    events.append(((entry.get("author") or {}).get("login"), parse_ts(entry.get("createdAt"))))
+            others = [(t, login) for login, t in events if t and is_human(login, me)]
+            last_other = max(others, default=(None, None))
+            activity[key] = {"mine": max([t for login, t in events if login == me and t], default=None),
+                             "other": last_other[0], "other_by": last_other[1]}
+    return activity
+
+
+def mirrored_key(title):
+    """pr-tracker issues are titled "[owner/repo#n] ..." after the PR they track."""
+    match = re.match(r"\[([\w.-]+/[\w.-]+)#(\d+)\]", title or "")
+    return f"{match[1]}#{match[2]}" if match else None
+
+
+def fetch_inbox(me):
+    """Review requests, unread participating notifications and recently active assigned issues."""
+    since = (date.today() - timedelta(days=2)).isoformat()
+    calls = {
+        "reviews": ["gh", "search", "prs", "--review-requested=@me", "--state=open", "--limit", "50",
+                    "--json", "number,title,repository,url,updatedAt,author"],
+        "notifications": ["gh", "api", "notifications?participating=true&per_page=50"],
+        "issues": ["gh", "search", "issues", "--assignee=@me", "--state=open", f"--updated=>={since}", "--limit", "50",
+                   "--json", "number,title,repository,url,updatedAt"],
+    }
+    raw = {}
+    for name, cmd in calls.items():
+        out = run(cmd)
+        if out is None:
+            raise GhError(name)
+        raw[name] = json.loads(out)
+    keys = set()
+    for note in raw["notifications"]:
+        match = re.search(r"/(?:issues|pulls)/(\d+)$", (note.get("subject") or {}).get("url") or "")
+        if match:
+            keys.add(f"{note['repository']['full_name']}#{match[1]}")
+            keys.add(mirrored_key(note["subject"].get("title")))
+    for issue in raw["issues"]:
+        keys.add(f"{issue['repository']['nameWithOwner']}#{issue['number']}")
+        keys.add(mirrored_key(issue["title"]))
+    raw["threads"] = thread_activity(filter(None, keys), me)
+    return raw
+
+
+def inbox_units(raw, workspace_keys):
+    units, seen = [], set(workspace_keys)
+    threads = raw.get("threads") or {}
+
+    def waiting(key, title):
+        """Latest comment by someone else that you have not answered, here or on the PR a tracker mirrors."""
+        thread, mirror = threads.get(key) or {}, threads.get(mirrored_key(title)) or {}
+        mine = max(filter(None, [thread.get("mine"), mirror.get("mine")]), default=None)
+        other = thread.get("other")
+        answered = mine is not None and (other is None or mine >= other)
+        return other, thread.get("other_by"), answered
+
+    def add(repo, number, title, url, updated, kind, prio, reason, alert=True, is_pr=True):
+        key = f"{repo}#{number}"
+        if key in seen or mirrored_key(title) in workspace_keys:
+            return
+        seen.add(key)
+        item_id = f"gh:{key}:{kind}"
+        units.append({
+            "workspace": key, "workspace_id": None, "inbox": True, "path": None, "machine": None, "agents": [],
+            "git": None, "tokens": {}, "linked_worktree": False, "active_at": parse_ts(updated),
+            "pr": {"key": key, "number": number, "title": title, "url": url, "state": "OPEN",
+                   "type": "pr" if is_pr else "issue", "ci": {"state": None}},
+            "items": [{"id": item_id, "kind": kind, "base_priority": prio, "text": f"{reason}: {title}",
+                       "reason": reason, "alert": item_id if alert else None}],
+        })
+
+    for pr in raw.get("reviews", []):
+        add(pr["repository"]["nameWithOwner"], pr["number"], pr["title"], pr["url"], pr["updatedAt"],
+            "review-requested", SOON, f"review requested by {(pr.get('author') or {}).get('login')}")
+    kinds = {"mention": "mentioned", "team_mention": "mentioned", "assign": "assigned",
+             "review_requested": "review-requested"}
+    reasons = {"mentioned": "you were mentioned", "assigned": "assigned to you", "review-requested": "review requested"}
+    for note in raw.get("notifications", []):
+        kind = kinds.get(note.get("reason"))
+        match = re.search(r"/(issues|pulls)/(\d+)$", (note.get("subject") or {}).get("url") or "")
+        if not note.get("unread") or not kind or not match:
+            continue
+        repo, is_pr, title = note["repository"]["full_name"], match[1] == "pulls", note["subject"]["title"]
+        if kind != "review-requested" and waiting(f"{repo}#{match[2]}", title)[2]:
+            continue  # You already answered after this came in.
+        url = f"https://github.com/{repo}/{'pull' if is_pr else 'issues'}/{match[2]}"
+        add(repo, int(match[2]), title, url, note.get("updated_at"), kind, SOON, reasons[kind], is_pr=is_pr)
+    for issue in raw.get("issues", []):
+        key = f"{issue['repository']['nameWithOwner']}#{issue['number']}"
+        other, other_by, answered = waiting(key, issue["title"])
+        if other is None or answered:
+            continue  # The recent activity is yours, or a bot's.
+        add(issue["repository"]["nameWithOwner"], issue["number"], issue["title"], issue["url"], issue["updatedAt"],
+            "issue-activity", WAITING, f"{other_by} commented {ago(other)} ago", other, is_pr=False)
+    return units
+
+
+def load_inbox(cache, units, warnings, overrides, me):
+    """Inbox units; items claimed by a workspace (PR description or `links` override) move onto its card."""
+    workspace_keys = {u["pr"]["key"] for u in units if u.get("pr") and u["pr"].get("key")}
+    claims = {}
+    for unit in units:
+        for ref in (unit.get("pr") or {}).get("refs") or []:
+            claims.setdefault(ref, unit)
+    by_label = {u["workspace"]: u for u in units}
+    for label, entry in overrides["workspace"].items():
+        for ref in entry.get("links", []):
+            if label in by_label:
+                claims[ref] = by_label[label]
+    hit, raw = cache.get("inbox", INBOX_TTL)
+    if not hit:
+        try:
+            raw = fetch_inbox(me)
+            cache.put("inbox", raw)
+        except (GhError, ValueError):
+            raw = cache.stale("inbox")
+            warnings.append("inbox: GitHub unavailable" + (", showing the last result" if raw else ""))
+    inbox = []
+    for unit in inbox_units(raw or {}, workspace_keys):
+        key = unit["pr"]["key"]
+        owner = claims.get(key) or claims.get(mirrored_key(unit["pr"]["title"]))
+        if owner is None:
+            inbox.append(unit)
+            continue
+        for item in unit["items"]:
+            owner["items"].append(dict(item, text=f"{key}: {item['text']}", linked=key, url=unit["pr"]["url"]))
+    return inbox
+
+
+# ------------------------------------------------------------------ overrides
+
+OVERRIDE_FIELDS = {"parked": bool, "snooze_until": object, "ignore_question": bool, "note": str, "links": list,
+                   "done": object}
+
+
+def snooze_timestamp(value):
+    """TOML date (until that day starts, local time), datetime, or an ISO string of either."""
+    if isinstance(value, str):
+        try:
+            value = datetime.fromisoformat(value)
+        except ValueError:
+            return None
+    if isinstance(value, datetime):
+        return value.timestamp()
+    if isinstance(value, date):
+        return datetime(value.year, value.month, value.day).timestamp()
+    return None
+
+
+def load_overrides(path=OVERRIDES_FILE):
+    """{"workspace": {label: entry}, "pr": {"n" or "owner/repo#n": entry}} plus warnings."""
+    overrides, warnings = {"workspace": {}, "pr": {}}, []
+    if not path.exists():
+        return overrides, warnings
+    import tomllib  # local only; the remote probe runs on older Pythons
+
+    try:
+        data = tomllib.loads(path.read_text())
+    except (tomllib.TOMLDecodeError, OSError) as error:
+        return overrides, [f"{path.name} ignored: {error}"]
+    for section, entries in data.items():
+        if section not in overrides or not isinstance(entries, dict):
+            warnings.append(f'{path.name}: unknown section "{section}", use [workspace."<label>"] or [pr."<n>"]')
+            continue
+        for key, entry in entries.items():
+            if not isinstance(entry, dict):
+                warnings.append(f'{path.name}: [{section}."{key}"] must be a table')
+                continue
+            clean = {}
+            for field, value in entry.items():
+                if field not in OVERRIDE_FIELDS:
+                    warnings.append(f'{path.name}: unknown field "{field}" in [{section}."{key}"]')
+                elif field == "links":
+                    refs = [normalize_ref(v) if isinstance(v, str) else None for v in value] if isinstance(
+                        value, list) else [None]
+                    if None in refs:
+                        warnings.append(f'{path.name}: links in [{section}."{key}"] must be "owner/repo#n" or URLs')
+                    clean["links"] = [r for r in refs if r]
+                elif field == "done":
+                    stamp = True if value is True else snooze_timestamp(value)
+                    if stamp is None or value is False:
+                        warnings.append(f'{path.name}: done in [{section}."{key}"] must be true or a date')
+                    else:
+                        clean["done"] = stamp
+                elif field == "snooze_until":
+                    stamp = snooze_timestamp(value)
+                    if stamp is None:
+                        warnings.append(f'{path.name}: snooze_until in [{section}."{key}"] is not a date')
+                    else:
+                        clean["snooze_until"], clean["snooze_label"] = stamp, str(value)
+                elif not isinstance(value, OVERRIDE_FIELDS[field]):
+                    warnings.append(f'{path.name}: {field} in [{section}."{key}"] must be '
+                                    f'{OVERRIDE_FIELDS[field].__name__}')
+                else:
+                    clean[field] = value
+            if section == "pr":
+                key = key.lstrip("#")
+            overrides[section][key] = clean
+    return overrides, warnings
+
+
+def toml_value(value):
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, date):
+        return value.isoformat()
+    return json.dumps(value)
+
+
+def section_of(line):
+    """(section, key) for a `[workspace."x"]` / `[pr."n"]` header line, else None."""
+    import tomllib
+
+    if not re.match(r"\s*\[[^\[]", line):
+        return None
+    try:
+        data = tomllib.loads(line.strip())
+    except tomllib.TOMLDecodeError:
+        return None
+    for section, entries in data.items():
+        if isinstance(entries, dict) and len(entries) == 1:
+            return section, next(iter(entries))
+    return None
+
+
+def set_override(section, key, field, value):
+    """Set one field of [section."key"] in overrides.toml (value None removes it), keeping everything else."""
+    old = OVERRIDES_FILE.read_text() if OVERRIDES_FILE.exists() else ""
+    lines = old.splitlines()
+    start = next((i for i, line in enumerate(lines) if section_of(line) == (section, key)), None)
+    rendered = None if value is None else f"{field} = {toml_value(value)}"
+    if start is None:
+        if rendered is None:
+            return
+        if lines and lines[-1].strip():
+            lines.append("")
+        lines += [f"[{section}.{json.dumps(key)}]", rendered]
+    else:
+        def section_end():
+            return next((i for i in range(start + 1, len(lines)) if re.match(r"\s*\[", lines[i])), len(lines))
+
+        end = section_end()
+        found = next((i for i in range(start + 1, end) if re.match(rf"\s*{field}\s*=", lines[i])), None)
+        if found is not None and rendered:
+            lines[found] = rendered
+        elif found is not None:
+            del lines[found]
+        elif rendered:
+            insert = end
+            while insert > start + 1 and not lines[insert - 1].strip():
+                insert -= 1
+            lines.insert(insert, rendered)
+        end = section_end()
+        if not any(line.strip() for line in lines[start + 1:end]):
+            del lines[start:end]
+            while start < len(lines) and start > 0 and not lines[start - 1].strip() and not lines[start].strip():
+                del lines[start]
+    text = "\n".join(lines).rstrip() + "\n"
+    OVERRIDES_FILE.write_text(text)
+    if any("ignored:" in w for w in load_overrides(OVERRIDES_FILE)[1]):
+        OVERRIDES_FILE.write_text(old)
+        raise ValueError(f"editing {OVERRIDES_FILE.name} would break it; left unchanged")
+
+
+def matching_overrides(overrides, label, pr):
+    found = []
+    if label in overrides["workspace"]:
+        found.append((f'workspace."{label}"', overrides["workspace"][label]))
+    if pr and pr.get("key"):
+        for key in (pr["key"], str(pr["number"])):
+            if key in overrides["pr"]:
+                found.append((f'pr."{key}"', overrides["pr"][key]))
+                break
+    return found
+
+
+def rank(units, overrides, now=None, partial=False):
+    """Apply overrides to every item, then order items within units and units by priority."""
+    now = time.time() if now is None else now
+    used = set()
+    for unit in units:
+        unit_matches = matching_overrides(overrides, unit["workspace"], unit.get("pr"))
+        notes = [entry["note"] for _, entry in unit_matches if entry.get("note")]
+        for item in unit["items"]:
+            matches = list(unit_matches)
+            if item.get("source"):
+                source_matches = matching_overrides(overrides, item["source"], None)
+                matches += source_matches
+                notes += [f"{item['source']}: {e['note']}" for _, e in source_matches if e.get("note")]
+            used.update(name for name, _ in matches)
+            item.update(state="active", priority=item["base_priority"])
+            item.pop("snoozed_until", None)
+            if item["kind"] == "agent-question" and any(e.get("ignore_question") for _, e in matches):
+                item.update(state="ignored", priority=None)
+                continue
+            done = [e["done"] for _, e in matches if "done" in e]
+            if done and (True in done or (unit.get("active_at") or 0) <= max(done)):
+                item.update(state="ignored", priority=None)
+                continue
+            snoozes = [e for _, e in matches if e.get("snooze_until", 0) > now]
+            if any(e.get("parked") for _, e in matches):
+                item.update(state="parked", priority=PARKED)
+            elif snoozes:
+                until = max(snoozes, key=lambda e: e["snooze_until"])
+                item.update(state="snoozed", priority=PARKED, snoozed_until=until["snooze_label"])
+        unit["notes"] = list(dict.fromkeys(notes))
+        active = sorted((i for i in unit["items"] if i["state"] != "ignored"),
+                        key=lambda i: (i["priority"], i["base_priority"]))
+        unit["priority"] = active[0]["priority"] if active else QUIET
+        unit["reasons"] = [item_text(i) for i in active]
+    units.sort(key=lambda u: (u["priority"], -(u.get("active_at") or 0)))
+    if partial:
+        return []  # --local or --workspace: absent workspaces are not evidence of a stale override
+    unused = [f"{section}.\"{key}\"" for section, entries in overrides.items() for key in entries
+              if f'{section}."{key}"' not in used]
+    return [f"{OVERRIDES_FILE.name}: {name} matches no current workspace or PR" for name in unused]
+
+
+def item_text(item):
+    if item.get("state") == "snoozed":
+        return f"{item['text']} (snoozed until {item['snoozed_until']})"
+    return item["text"]
+
+
+def visible_items(unit):
+    return [i for i in sorted(unit["items"], key=lambda i: (i["priority"] if i["priority"] is not None else 9))
+            if i["state"] != "ignored" and i["kind"] not in HIDDEN_KINDS]
+
+
+def in_inbox(unit):
+    """Open inbox items; parked ones show under PARKED, dismissed ones (done) nowhere."""
+    return bool(unit.get("inbox")) and unit["priority"] not in (PARKED, QUIET)
+
+
+def on_board(unit):
+    return not unit.get("inbox") or unit["priority"] == PARKED
+
+
+# --------------------------------------------------------------------- output
+
+
+def last_activity(unit):
+    own = [a.get("last_activity") for a in unit["agents"]] + [(unit.get("git") or {}).get("last_commit")]
+    return max(filter(None, own + [last_activity(r) for r in unit.get("remotes", [])]), default=None)
+
+
+DRACULA = {"red": "ff5555", "orange": "ffb86c", "yellow": "f1fa8c", "green": "50fa7b", "cyan": "8be9fd",
+           "purple": "bd93f9", "pink": "ff79c6", "comment": "6272a4", "fg": "f8f8f2"}
+PRIO_COLORS = {NOW: "red", SOON: "orange", RUNNING: "cyan", WAITING: "yellow", CLEANUP: "purple", QUIET: "comment",
+               PARKED: "comment"}
+KIND_ICONS = {
+    "agent-blocked": ("!", "red"), "agent-done": ("●", "green"), "agent-working": ("◐", "cyan"),
+    "agent-question": ("?", "yellow"), "ci-failing": ("✗", "red"), "ci-running": ("…", "cyan"),
+    "approved-green": ("✓", "green"), "awaiting-review": ("○", "comment"), "changes-requested": ("✎", "orange"),
+    "feedback": ("✎", "cyan"), "unresolved-threads": ("✎", "comment"), "discussion": ("✎", "comment"),
+    "rereview": ("↻", "cyan"), "review-requested": ("↻", "orange"), "reviewing": ("·", "comment"),
+    "pr-merged": ("⊕", "purple"), "pr-closed": ("⊘", "comment"), "unpushed": ("↑", "orange"),
+    "stale-changes": ("±", "orange"), "mentioned": ("@", "pink"), "assigned": ("◆", "pink"),
+    "issue-activity": ("✎", "comment"), "merge-queued": ("↠", "cyan"), "dequeued": ("✗", "red"),
+    "merge-queue-failed": ("✗", "red"),
+}
+CI_ICONS = {"fail": ("✗", "red"), "pending": ("…", "yellow"), "pass": ("✓", "green")}
+ANSI = re.compile(r"\033\[[0-9;]*m|\033\]8;;[^\033]*\033\\")
+
+
+def paint(text, color=None, bold=False, dim=False, italic=False):
+    codes = (["1"] if bold else []) + (["2"] if dim else []) + (["3"] if italic else [])
+    if color:
+        hex_ = DRACULA.get(color, color)
+        codes.append("38;2;" + ";".join(str(int(hex_[i:i + 2], 16)) for i in (0, 2, 4)))
+    return f"\033[{';'.join(codes)}m{text}\033[0m" if codes else text
+
+
+def link(text, url):
+    """OSC 8 hyperlink: clickable where the terminal supports it, plain text elsewhere."""
+    return f"\033]8;;{url}\033\\{text}\033]8;;\033\\" if url else text
+
+
+def url_line(bar, url, width, indent="  "):
+    """Never clipped: a clipped URL is a broken link, so a narrow pane wraps it instead."""
+    return f"{bar}{indent}{paint('↗', 'comment')} {paint(link(url, url), 'comment')}"
+
+
+def vlen(text):
+    return len(ANSI.sub("", text))
+
+
+def clip(text, width):
+    return text if len(text) <= width else text[:max(width - 1, 0)] + "…"
+
+
+def board_text(unit, item):
+    """Item text without what the card header already says."""
+    text = item_text(item)
+    text = re.sub(r"\bagent w[0-9A-Za-z]+:p\d+ ", "agent ", text)
+    pr = unit.get("pr")
+    if pr:
+        text = re.sub(rf" on #{pr['number']}\b", "", text)
+        text = re.sub(rf"^PR #{pr['number']} ", "PR ", text)
+        text = re.sub(rf"^#{pr['number']} ", "", text)
+    return text
+
+
+def card(unit, width, color):
+    bar = paint("▌", color)
+    git, pr = unit.get("git") or {}, unit.get("pr")
+    age = ago(unit.get("active_at"))
+    name = clip(unit["workspace"], width - len(age) - 4)
+    lines = [f"{bar}{paint(name, bold=True)}{' ' * (width - len(name) - len(age) - 2)}{paint(age, 'comment')}"]
+
+    meta = []
+    url = pr.get("url") if pr and not unit.get("inbox") else None
+    if url:
+        icon, ci_color = CI_ICONS.get(pr["ci"]["state"], ("", None))
+        state = ("draft" if pr.get("draft") else "queued" if pr.get("merge_queue")
+                 else "" if pr["state"] == "OPEN" else pr["state"].lower())
+        meta.append((f"#{pr['number']}" + (f" {state}" if state else ""), "purple", url))
+        if icon:
+            meta.append((icon, ci_color, None))
+    if git.get("branch") and git["branch"] != unit["workspace"]:
+        meta.append((git["branch"], "comment", None))
+    if git.get("dirty"):
+        meta.append((f"±{git['dirty']}", "orange", None))
+    if meta:
+        room, parts = width - 4, []
+        for text, part_color, target in meta:
+            text = clip(text, room)
+            if room <= 1:
+                break
+            parts.append(paint(link(text, target), part_color))
+            room -= len(text) + 1
+        lines.append(f"{bar}  " + " ".join(parts))
+    if url and pr["state"] == "OPEN":
+        lines.append(url_line(bar, url, width))
+
+    for item in visible_items(unit):
+        icon, icon_color = KIND_ICONS.get(item["kind"], ("-", "comment"))
+        muted = item["state"] in ("parked", "snoozed")
+        wrapped = textwrap.wrap(board_text(unit, item), width - 6) or [""]
+        lines.append(f"{bar}  {paint(icon, 'comment' if muted else icon_color, bold=True)} "
+                     f"{paint(wrapped[0], 'comment' if muted else None)}")
+        lines += [f"{bar}    {paint(rest, 'comment' if muted else None)}" for rest in wrapped[1:]]
+        if item.get("url"):
+            lines.append(url_line(bar, item["url"], width, indent="    "))
+    for note in unit.get("notes", []):
+        for i, part in enumerate(textwrap.wrap(note, width - 6)):
+            lines.append(f"{bar}  {paint('»' if i == 0 else ' ', 'pink')} {paint(part, 'comment', italic=True)}")
+    for remote in unit.get("remotes", []):
+        host, _, label = remote["workspace"].partition(":")
+        agents = [a for a in remote["agents"] if a.get("title")]
+        status = agents[0]["status"] if agents else None
+        head = f"{paint('↳', 'pink')} {paint(host, 'pink', bold=True)} {paint(label, 'comment')}"
+        tail = ago(last_activity(remote))
+        lines.append(f"{bar}  {head}{' ' * max(width - vlen(head) - len(tail) - 4, 1)}{paint(tail, 'comment')}")
+        for agent in agents:
+            icon, icon_color = KIND_ICONS.get(f"agent-{agent['status']}", ("○", "comment"))
+            text = clip(agent["title"], width - 8)
+            lines.append(f"{bar}    {paint(icon, icon_color)} {paint(text, 'comment' if status == 'idle' else None)}")
+    return lines
+
+
+def inbox_card(unit, width):
+    bar = paint("▌", "pink")
+    items = visible_items(unit)
+    icon, icon_color = KIND_ICONS.get(items[0]["kind"], ("◆", "pink")) if items else ("◆", "pink")
+    age = ago(unit.get("active_at"))
+    name = clip(unit["pr"]["key"], width - len(age) - 6)
+    lines = [f"{bar}{paint(icon, icon_color, bold=True)} {paint(link(name, unit['pr'].get('url')), bold=True)}"
+             f"{' ' * max(width - len(name) - len(age) - 4, 1)}{paint(age, 'comment')}",
+             f"{bar}  {clip(unit['pr'].get('title') or '', width - 4)}"]
+    if unit["pr"].get("url"):
+        lines.append(url_line(bar, unit["pr"]["url"], width))
+    for item in items:
+        lines.append(f"{bar}  {paint(clip(item.get('reason') or item['text'], width - 4), 'comment')}")
+    for note in unit.get("notes", []):
+        lines.append(f"{bar}  {paint('»', 'pink')} {paint(clip(note, width - 6), 'comment', italic=True)}")
+    return lines
+
+
+def rule(name, count, color, width):
+    label = f" {name} "
+    tail = f" {count} "
+    return (paint("──", color) + paint(label, color, bold=True)
+            + paint("─" * max(width - len(label) - len(tail) - 5, 2), color, dim=True)
+            + paint(tail, color) + paint("──", color))
+
+
+def render_text(units, width, warnings=()):
+    width = max(min(width, 100), 36)
+    color = sys.stdout.isatty() or bool(os.environ.get("ORCH_COLOR"))
+    inbox = [u for u in units if in_inbox(u)]
+    board = [u for u in units if on_board(u)]
+    counts = {prio: sum(1 for u in board if u["priority"] == prio) for prio in PRIO_NAMES}
+
+    def chip(prio):
+        return paint("●", PRIO_COLORS[prio]) + " " + paint(f"{counts[prio]} {PRIO_NAMES[prio].lower()}",
+                                                          None if counts[prio] else "comment")
+
+    chips = [chip(NOW), chip(SOON),
+             paint("◆", "pink") + " " + paint(f"{len(inbox)} inbox", None if inbox else "comment"),
+             chip(RUNNING), chip(WAITING), chip(CLEANUP),
+             paint(f"○ {counts[PARKED]} parked · {counts[QUIET]} quiet", "comment")]
+    lines, row = [], " "
+    for piece in chips:
+        if vlen(row) + vlen(piece) + 2 > width:
+            lines.append(row.rstrip())
+            row = " "
+        row += piece + "  "
+    lines += [row.rstrip(), ""]
+    for warning in warnings:
+        lines += [paint(part, "orange") for part in textwrap.wrap(warning, width - 2, initial_indent="! ",
+                                                                   subsequent_indent="  ")]
+    if warnings:
+        lines.append("")
+
+    def section(prio):
+        group = [u for u in board if u["priority"] == prio]
+        if group:
+            lines.append(rule(PRIO_NAMES[prio], len(group), PRIO_COLORS[prio], width))
+            for u in group:
+                lines.extend(card(u, width, PRIO_COLORS[prio]) + [""])
+
+    section(NOW)
+    section(SOON)
+    if inbox:
+        lines.append(rule("INBOX", len(inbox), "pink", width))
+        for u in inbox:
+            lines.extend(inbox_card(u, width) + [""])
+    for prio in (RUNNING, WAITING, CLEANUP, PARKED):
+        section(prio)
+    quiet = [u for u in board if u["priority"] == QUIET]
+    if quiet:
+        lines.append(rule("QUIET", len(quiet), "comment", width))
+        sep = paint(" · ", "comment")
+        rows, row_items, row_len = [], [], 1
+        for u in quiet:
+            name = u["workspace"]
+            if row_items and row_len + len(name) + 3 > width:
+                rows.append(row_items)
+                row_items, row_len = [], 1
+            row_items.append(paint(name, "comment"))
+            row_len += len(name) + 3
+        rows.append(row_items)
+        lines += [" " + sep.join(r) for r in rows if r]
+    text = "\n".join(lines).rstrip() + "\n"
+    return text if color else ANSI.sub("", text)
+
+
+def sidebar_tokens(units):
+    by_ws = {}
+    for u in units:
+        if u.get("machine") or u.get("inbox"):
+            continue
+        tokens = by_ws.setdefault(u["workspace_id"], {})
+        pr = u.get("pr")
+        if not pr:
+            continue
+        if pr["state"] == "MERGED":
+            tokens["pr"] = "merged"
+        elif pr["state"] == "CLOSED":
+            tokens["pr"] = "closed"
+        else:
+            if pr.get("merge_queue"):
+                tokens["pr"] = "queued"
+            ci = {"fail": "✗", "pending": "…", "pass": "✓"}.get(pr["ci"]["state"])
+            if ci:
+                tokens["ci"] = ci
+            kinds = {i["kind"] for i in u["items"]}
+            if kinds & {"feedback", "changes-requested"}:
+                tokens["fb"] = f"✎{pr.get('unresolved_threads') or ''}"
+            elif kinds & {"rereview", "review-requested"}:
+                tokens["fb"] = "↻"
+    return by_ws
+
+
+def report_sidebar(units, ttl_ms):
+    for ws_id, tokens in sidebar_tokens(units).items():
+        args = ["herdr", "workspace", "report-metadata", ws_id, "--source", TOKEN_SOURCE, "--ttl-ms", str(ttl_ms)]
+        for name in TOKENS:
+            args += ["--token", f"{name}={tokens[name]}"] if name in tokens else ["--clear-token", name]
+        run(args)
+
+
+def infer_kind(*names):
+    for name in names:
+        if re.match(r"(pr|review)[/-]", name or ""):
+            return "r"
+        if re.match(r"(bug|bugfix|fix|hotfix)[/-]|issue-", name or ""):
+            return "b"
+        if re.match(r"(feat|feature)[/-]", name or ""):
+            return "f"
+    return None
+
+
+def restore_kinds(units):
+    """Workspace metadata is lost on a Herdr server restart; put the r/b/f tag back where it can be inferred."""
+    done = set()
+    for u in units:
+        if (u.get("machine") or u.get("inbox") or u["workspace_id"] in done or "kind" in u["tokens"]
+                or not u["linked_worktree"] or not u["path"]):
+            continue
+        done.add(u["workspace_id"])
+        try:
+            rel = str(Path(u["path"]).relative_to(WORKTREE_ROOT)) if WORKTREE_ROOT else ""
+        except ValueError:
+            rel = ""
+        kind = infer_kind(rel, (u.get("git") or {}).get("branch"), u["workspace"])
+        if kind:
+            run(["herdr", "workspace", "report-metadata", u["workspace_id"], "--source", "custom:kind",
+                 "--token", f"kind={kind}"])
+
+
+def notify(units):
+    """Notify once per new alert, and when running CI turns green; parked and snoozed items stay silent."""
+    previous, previous_running = None, {}
+    if STATE_FILE.exists():
+        try:
+            state = json.loads(STATE_FILE.read_text())
+            if state.get("version") == 2:
+                previous, previous_running = set(state["alerts"]), state.get("running", {})
+        except (ValueError, KeyError):
+            previous = None
+    current, running = {}, {}
+    for u in units:
+        for item in u["items"]:
+            if item["state"] != "active":
+                continue
+            if item.get("alert"):
+                current[item["alert"]] = (u["workspace"], item_text(item), item["kind"])
+            if item["kind"] == "ci-running":
+                running[item["id"]] = u["workspace"]
+    write_json(STATE_FILE, {"version": 2, "updated": time.time(), "alerts": sorted(current), "running": running})
+    if previous is None:
+        return  # First run (or old state format) only seeds the state.
+    messages = [(workspace, text, "done" if kind == "pr-merged" else "request")
+                for key, (workspace, text, kind) in current.items() if key not in previous]
+    by_label = {u["workspace"]: u for u in units}
+    for item_id, workspace in previous_running.items():
+        unit = by_label.get(workspace)
+        pr = (unit or {}).get("pr") or {}
+        if item_id not in running and unit and unit["priority"] != PARKED and pr.get("ci", {}).get("state") == "pass":
+            messages.append((workspace, f"CI passed on #{pr['number']}", "done"))
+    for workspace, text, sound in messages[:5]:
+        run(["herdr", "notification", "show", workspace, "--body", text, "--sound", sound])
+
+
+# ------------------------------------------------------------- items and TODO
+
+
+def write_json(path, data):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + f".{os.getpid()}.tmp")
+    tmp.write_text(json.dumps(data, indent=1, default=str) + "\n")
+    tmp.replace(path)
+
+
+def write_items(units, warnings):
+    """Raw items (before overrides) with the unit context overrides and TODO.md need."""
+    write_json(ITEMS_FILE, {"generated": time.time(), "warnings": warnings, "units": [{
+        "workspace": u["workspace"], "workspace_id": u["workspace_id"], "machine": u.get("machine"),
+        "machine_id": u.get("machine_id"), "inbox": bool(u.get("inbox")), "path": u["path"], "active_at": u.get("active_at"),
+        "remotes": [r["workspace"] for r in u.get("remotes", [])],
+        "pr": {k: u["pr"].get(k) for k in ("key", "number", "title", "url", "state", "type")} if u.get("pr") else None,
+        "items": [{k: i.get(k) for k in ("id", "kind", "base_priority", "text", "reason", "source", "alert", "url")}
+                  for i in u["items"]],
+    } for u in units]})
+
+
+TODO_SECTIONS = (("Now", (NOW,)), ("Soon", (SOON,)), ("Inbox", ()), ("Running", (RUNNING,)),
+                 ("Waiting", (WAITING,)), ("Cleanup", (CLEANUP,)), ("Parked", (PARKED,)))
+TODO_HEADINGS = {name for name, _ in TODO_SECTIONS} | {"Notes", "Done"}
+DONE_KEEP = 20
+
+
+def kind_of(item_id):
+    return item_id.rsplit(":", 1)[-1].split("~", 1)[0]
+
+
+def todo_sections(text):
+    """Body lines of each generated `## <name>` section; other headings stay inside the section they are in."""
+    sections, current = {}, None
+    for line in text.splitlines():
+        match = re.match(r"## (.+?)\s*$", line)
+        if match and match[1] in TODO_HEADINGS:
+            current = match[1]
+            sections[current] = []
+        elif current:
+            sections[current].append(line)
+    return sections
+
+
+def todo_lines(units):
+    """Markdown lines per TODO section, item counts, and {id: text} of everything listed."""
+    lines = {name: [] for name, _ in TODO_SECTIONS}
+    counts = {name: 0 for name, _ in TODO_SECTIONS}
+    listed = {}
+    for unit in units:
+        noted = False
+        for item in visible_items(unit):
+            if in_inbox(unit):
+                section = "Inbox"
+            else:
+                section = next((name for name, prios in TODO_SECTIONS if item["priority"] in prios), None)
+            if section is None:
+                continue
+            line = f"- [{unit['workspace']}] {item_text(item)}"
+            pr = unit.get("pr") or {}
+            if pr.get("url") and (unit.get("inbox") or f"#{pr['number']}" in item["text"]):
+                line += f" ({pr['url']})"
+            listed[item["id"]] = f"[{unit['workspace']}] {item['text']}"
+            lines[section].append(f"{line} <!-- {item['id']} -->")
+            counts[section] += 1
+            if not noted:
+                lines[section] += [f"  - note: {note}" for note in unit.get("notes", [])]
+                noted = True
+    return lines, counts, listed
+
+
+def append_history(entries):
+    if entries:
+        HISTORY_FILE.parent.mkdir(parents=True, exist_ok=True)
+        with HISTORY_FILE.open("a") as f:
+            f.writelines(json.dumps(entry) + "\n" for entry in entries)
+
+
+def history_since(stamp):
+    if not HISTORY_FILE.exists():
+        return []
+    entries = []
+    for line in HISTORY_FILE.read_text().splitlines():
+        try:
+            entry = json.loads(line)
+        except ValueError:
+            continue
+        if entry.get("ts", 0) >= stamp:
+            entries.append(entry)
+    return entries
+
+
+def render_todo(quiet=False):
+    if not ITEMS_FILE.exists():
+        sys.exit(f"herdr-status: {ITEMS_FILE} missing; run bin/herdr-status once (or wait for orch-watch)")
+    snapshot = json.loads(ITEMS_FILE.read_text())
+    units = snapshot["units"]
+    overrides, warnings = load_overrides()
+    warnings += rank(units, overrides)
+
+    old = TODO_FILE.read_text() if TODO_FILE.exists() else ""
+    sections = todo_sections(old)
+    notes = sections.get("Notes", [])
+    if notes and notes[-1].strip():
+        notes = notes + [""]
+    lines_by_section, counts, listed = todo_lines(units)
+
+    # Items that left the board since the previous render move to Done, unless their machine was unreachable.
+    unreachable = {w.split(":", 1)[0] for w in snapshot.get("warnings", [])}
+    previous, first_render = {}, not TODO_STATE.exists()
+    if not first_render:
+        try:
+            previous = json.loads(TODO_STATE.read_text()).get("items", {})
+        except ValueError:
+            previous = {}
+    present = {item["id"] for unit in units for item in unit["items"]}
+    finished = {item_id: text for item_id, text in previous.items()
+                if item_id not in present and kind_of(item_id) not in TRANSIENT_KINDS
+                and not any(f"ws:{host}:" in item_id for host in unreachable)}
+    appeared = {} if first_render else {item_id: text for item_id, text in listed.items()
+                                        if item_id not in previous and kind_of(item_id) not in TRANSIENT_KINDS}
+    now = time.time()
+    append_history([{"ts": now, "event": "done", "id": i, "kind": kind_of(i), "text": t} for i, t in finished.items()]
+                   + [{"ts": now, "event": "new", "id": i, "kind": kind_of(i), "text": t} for i, t in appeared.items()])
+    today = date.today().isoformat()
+    done = [f"- {today} {text}" for text in finished.values()]
+    done += [line for line in sections.get("Done", []) if line.startswith("- ")]
+
+    generated = datetime.fromtimestamp(snapshot["generated"]).strftime("%Y-%m-%d %H:%M")
+    out = ["# TODO", "",
+           f"<!-- Generated by `bin/herdr-status --todo` from state/items.json ({generated}) and "
+           "state/overrides.toml. Everything except Notes is rewritten on every render. -->", ""]
+    if now - snapshot["generated"] > 3600:
+        out += [f"> Board data is {ago(snapshot['generated'])} old; run `bin/herdr-status` to refresh.", ""]
+    out += [f"> {w}" for w in warnings] + ([""] if warnings else [])
+    for name, _ in TODO_SECTIONS:
+        out += [f"## {name}", ""] + lines_by_section[name] + ([""] if lines_by_section[name] else [])
+    out += ["## Notes"] + (notes if notes else [""])
+    out += ["## Done", ""] + done[:DONE_KEEP]
+    text = "\n".join(out).rstrip() + "\n"
+
+    if old and old != text:
+        (STATE_DIR / "TODO.prev.md").write_text(old)
+    tmp = TODO_FILE.with_suffix(f".md.{os.getpid()}.tmp")
+    tmp.write_text(text)
+    tmp.replace(TODO_FILE)
+    write_json(TODO_STATE, {"rendered": now, "items": listed})
+    if not quiet:
+        summary = ", ".join(f"{n} {name.lower()}" for name, n in counts.items() if n)
+        print(f"{TODO_FILE}: {summary or 'nothing open'}" + (f"; {len(finished)} moved to done" if finished else ""))
+        for warning in warnings:
+            print(f"! {warning}", file=sys.stderr)
+
+
+# ------------------------------------------------------------------ briefings
+
+FOCUS_HEADING = "## Focus today"
+FOCUS_PLACEHOLDER = "_Pending: the orchestrator fills this in (`/briefing` in the orchestrator session)._"
+MOVED_HEADING = "## What moved today"
+
+
+def moved_lines(entries):
+    """Net change per item over the entries: merged or closed, resolved, and new."""
+    last = {}
+    for entry in entries:
+        last[entry["id"]] = entry
+    merged = [e for e in last.values() if e["event"] == "new" and e["kind"] in ("pr-merged", "pr-closed")]
+    resolved = [e for e in last.values() if e["event"] == "done" and e["kind"] not in ("pr-merged", "pr-closed")]
+    new = [e for e in last.values() if e["event"] == "new" and e["kind"] not in ("pr-merged", "pr-closed")]
+    lines = []
+    for title, group in (("Merged or closed", merged), ("Resolved", resolved), ("New", new)):
+        lines += [f"### {title}", ""] + ([f"- {e['text']}" for e in group] or ["- nothing"]) + [""]
+    return lines
+
+
+def todays_briefings(day):
+    return sorted(BRIEFINGS.glob(f"{day}*.md"), key=lambda p: p.stat().st_mtime)
+
+
+def write_briefing(units, warnings, force=False):
+    """Dated skeleton from the board; the orchestrator's /briefing fills in Focus today."""
+    day = date.today().isoformat()
+    path = BRIEFINGS / f"{day}.md"
+    if path.exists():
+        if not force:
+            print(f"{path}: already written today (use --force for another version)")
+            return path
+        version = 2
+        while (BRIEFINGS / f"{day}.{version}.md").exists():
+            version += 1
+        path = BRIEFINGS / f"{day}.{version}.md"
+    earlier = sorted((p for p in BRIEFINGS.glob("????-??-??*.md") if not p.name.startswith(day)),
+                     key=lambda p: p.stat().st_mtime)
+    since = earlier[-1].stat().st_mtime if earlier else time.time() - 86400
+    since_heading = f"## Since the last briefing ({earlier[-1].name[:10]})" if earlier else "## Last 24 hours"
+    sections, counts, _ = todo_lines(units)
+    stamp = datetime.now()
+    lines = [f"# Briefing · {stamp:%A %Y-%m-%d}", "",
+             f"<!-- Written by `bin/herdr-status --briefing` at {stamp:%H:%M}. The orchestrator fills in "
+             "Focus today; What moved today is added at the end of the day. -->", ""]
+    lines += [f"> {w}" for w in warnings] + ([""] if warnings else [])
+    lines += [FOCUS_HEADING, "", FOCUS_PLACEHOLDER, "", since_heading, ""]
+    lines += moved_lines(history_since(since))
+    lines += ["## Open", ""]
+    for name, _ in TODO_SECTIONS:
+        if sections[name]:
+            lines += [f"### {name} ({counts[name]})", ""] + sections[name] + [""]
+    BRIEFINGS.mkdir(parents=True, exist_ok=True)
+    path.write_text("\n".join(lines).rstrip() + "\n")
+    print(path)
+    return path
+
+
+def write_what_moved():
+    """Add (or refresh) the What moved today section of today's newest briefing."""
+    day = date.today().isoformat()
+    existing = todays_briefings(day)
+    path = existing[-1] if existing else BRIEFINGS / f"{day}.md"
+    text = path.read_text() if path.exists() else f"# Briefing · {datetime.now():%A %Y-%m-%d}\n"
+    start_of_day = datetime.combine(date.today(), datetime.min.time()).timestamp()
+    section = [MOVED_HEADING, "", f"_As of {datetime.now():%H:%M}._", ""] + moved_lines(history_since(start_of_day))
+    body = "\n".join(section).rstrip() + "\n"
+    if MOVED_HEADING in text:
+        head, rest = text.split(MOVED_HEADING, 1)
+        following = re.search(r"^## ", rest, flags=re.M)
+        text = head + body + ("\n" + rest[following.start():] if following else "")
+    else:
+        text = text.rstrip() + "\n\n" + body
+    BRIEFINGS.mkdir(parents=True, exist_ok=True)
+    path.write_text(text)
+    print(path)
+    return path
+
+
+# ---------------------------------------------------------------------- cache
+
+
+class GhError(Exception):
+    pass
+
+
+class Cache:
+    """state/cache.json: GitHub and remote lookups reused between runs. mode "cached" accepts any age."""
+
+    def __init__(self, mode="ttl", max_age=None):
+        self.mode, self.max_age = mode, max_age
+        self.lock = threading.Lock()
+        self.data = self._load()
+        self.dirty = {}
+
+    @staticmethod
+    def _load():
+        try:
+            return json.loads(CACHE_FILE.read_text())
+        except (OSError, ValueError):
+            return {}
+
+    def get(self, key, ttl, signature=None):
+        entry = self.data.get(key)
+        if not entry or entry.get("sig") != signature:
+            return False, None
+        if self.mode == "cached":
+            return True, entry["value"]
+        limit = ttl(entry["value"]) if callable(ttl) else ttl
+        if self.max_age is not None:
+            limit = min(limit, self.max_age)
+        fresh = time.time() - entry["at"] <= limit
+        return fresh, entry["value"] if fresh else None
+
+    def stale(self, key):
+        return (self.data.get(key) or {}).get("value")
+
+    def put(self, key, value, signature=None):
+        with self.lock:
+            self.data[key] = self.dirty[key] = {"at": time.time(), "sig": signature, "value": value}
+
+    def save(self):
+        if not self.dirty:
+            return
+        merged = self._load()
+        merged.update(self.dirty)
+        cutoff = time.time() - 7 * 86400
+        write_json(CACHE_FILE, {k: v for k, v in merged.items() if v.get("at", 0) > cutoff})
+
+
+def pr_ttl(value):
+    if not value:
+        return 600
+    if value.get("state") != "OPEN":
+        return 3600
+    return 90 if (value.get("ci") or {}).get("state") == "pending" or value.get("merge_queue") else 300
+
+
+def cached_remote(machine, cache):
+    key = f"remote:{machine['id']}"
+    hit, value = cache.get(key, REMOTE_TTL)
+    if hit:
+        return value[0], value[1]
+    units, warning = remote_units(machine)
+    cache.put(key, [units, warning])
+    return units, warning
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    parser.add_argument("--json", action="store_true", help="full machine-readable output")
+    parser.add_argument("--sidebar", action="store_true", help="report ci/pr/fb tokens to the Herdr sidebar")
+    parser.add_argument("--kind", action="store_true", help="restore missing r/b/f kind tokens")
+    parser.add_argument("--notify", action="store_true", help="notify about new alerts since the previous run")
+    parser.add_argument("--ttl", type=int, default=1800, help="sidebar token lifetime in seconds")
+    parser.add_argument("--workspace", help="only workspaces whose label contains this text")
+    parser.add_argument("--width", type=int, default=int(os.environ.get("COLUMNS", "120")))
+    parser.add_argument("--local", action="store_true", help="skip remote Herdr machines")
+    parser.add_argument("--no-inbox", action="store_true", help="skip the GitHub inbox")
+    parser.add_argument("--cached", action="store_true", help="reuse cached GitHub and remote data of any age")
+    parser.add_argument("--max-age", type=int, help="refetch cached GitHub and remote data older than this (s)")
+    parser.add_argument("--todo", action="store_true",
+                        help="render TODO.md from state/items.json and state/overrides.toml, without collecting")
+    parser.add_argument("--refresh-todo", action="store_true", help="after collecting, render TODO.md as well")
+    parser.add_argument("--briefing", action="store_true", help="after collecting, write today's briefing skeleton")
+    parser.add_argument("--force", action="store_true", help="with --briefing: write another version for today")
+    parser.add_argument("--what-moved", action="store_true", help="add What moved today to today's briefing")
+    parser.add_argument("--probe", help=argparse.SUPPRESS)
+    args = parser.parse_args()
+    if args.probe:
+        print(json.dumps(probe(json.loads(args.probe))))
+        return
+    if args.todo:
+        load_config()
+        render_todo()
+        return
+    if args.what_moved and not args.briefing:
+        write_what_moved()
+        return
+
+    _, config_warnings = load_config()
+    workspaces = (herdr("workspace", "list") or {}).get("workspaces", [])
+    agents = (herdr("agent", "list") or {}).get("agents", [])
+    panes = (herdr("pane", "list") or {}).get("panes", [])
+    if not workspaces:
+        sys.exit("herdr-status: no Herdr workspaces found (is the Herdr server running?)")
+    cache = Cache("cached" if args.cached else "ttl", args.max_age)
+    hit, me = cache.get("me", 86400)
+    if not hit:
+        me = (run(["gh", "api", "user", "--jq", ".login"]) or "").strip() or cache.stale("me") or ""
+        if me:
+            cache.put("me", me)
+
+    with cf.ThreadPoolExecutor(max_workers=8) as pool:
+        remote_jobs = [] if args.local else [pool.submit(cached_remote, m, cache) for m in machines()]
+        local = list(pool.map(enrich_local, collect_units(workspaces, agents, panes, exclude=ROOT.resolve())))
+        remote, warnings = [], list(config_warnings)
+        for job in remote_jobs:
+            found, warning = job.result()
+            remote += found
+            warnings += [warning] if warning else []
+        link_remotes(local, remote)
+        units = local + remote
+        if args.workspace:
+            units = [u for u in units if args.workspace in u["workspace"] or args.workspace in u.get("linked_to", "")]
+        units = list(pool.map(lambda u: enrich_github(u, me, cache), units))
+    units = attach_remotes(units)
+    overrides, override_warnings = load_overrides()
+    if not args.workspace and not args.no_inbox:
+        units += load_inbox(cache, units, warnings, overrides, me)
+
+    full = not args.workspace and not args.local
+    if full:
+        write_items(units, warnings)
+    warnings += override_warnings + rank(units, overrides, partial=not full)
+
+    if args.sidebar and full:
+        report_sidebar(units, args.ttl * 1000)
+    if args.kind:
+        restore_kinds(units)
+    if args.notify and full:
+        notify(units)
+    if args.refresh_todo and full:
+        render_todo(quiet=True)
+    cache.save()
+    if args.briefing:
+        write_briefing(units, warnings, args.force)
+        if args.what_moved:
+            write_what_moved()
+    elif args.json:
+        print(json.dumps({"generated": time.time(), "me": me, "warnings": warnings, "units": units},
+                         indent=1, default=str))
+    else:
+        sys.stdout.write(render_text(units, args.width, warnings))
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,315 @@
+#!/usr/bin/env python3
+"""Live board for bin/herdr-status.
+
+Refreshes on Herdr events (agent status changes, panes and workspaces coming and going) from cache,
+ticks every ORCH_INTERVAL seconds (default 60) to refetch whatever has expired in the cache, and
+refetches everything when you press enter. On weekdays it writes the briefing at ORCH_BRIEFING_AT
+(default 09:00) or when you open the orchestrator workspace, whichever comes first, asks the
+orchestrator session to fill in its focus list, and adds What moved today at ORCH_WHAT_MOVED_AT
+(default 18:00).
+"""
+import json
+import os
+import re
+import select
+import shutil
+import socket
+import subprocess
+import sys
+import time
+from datetime import date, datetime
+from pathlib import Path
+
+HERE = Path(__file__).resolve().parent
+ROOT = HERE.parent
+STATUS = HERE / "herdr-status"
+BRIEFINGS = ROOT / "briefings"
+WATCH_STATE = ROOT / "state" / "watch.json"
+OVERRIDES = ROOT / "state" / "overrides.toml"
+
+
+def settings():
+    """[watch] in orchestrator.toml, overridden by ORCH_* environment variables."""
+    config = {"interval": 60, "briefing_at": "09:00", "what_moved_at": "18:00", "agent": "orchestrator",
+              "kind_tags": False}
+    try:
+        import tomllib
+
+        data = tomllib.loads((ROOT / "orchestrator.toml").read_text())
+        config.update(data.get("watch") or {})
+        config["kind_tags"] = bool(data.get("kind_tags", False))
+    except (OSError, ValueError, ImportError):
+        pass
+    return config
+
+
+SETTINGS = settings()
+TICK = int(os.environ.get("ORCH_INTERVAL", SETTINGS["interval"]))
+BRIEFING_AT = os.environ.get("ORCH_BRIEFING_AT", SETTINGS["briefing_at"])
+WHAT_MOVED_AT = os.environ.get("ORCH_WHAT_MOVED_AT", SETTINGS["what_moved_at"])
+ORCHESTRATOR = os.environ.get("ORCH_AGENT", SETTINGS["agent"])
+OWN_WORKSPACE = os.environ.get("HERDR_WORKSPACE_ID")
+DEBOUNCE = 1.5
+PROMPT_GIVE_UP = 3600
+GLOBAL_EVENTS = ("pane.created", "pane.closed", "pane.exited", "pane.agent_detected", "workspace.created",
+                 "workspace.closed", "workspace.renamed", "workspace.focused", "worktree.created",
+                 "worktree.opened", "worktree.removed")
+TOPOLOGY_EVENTS = {"pane_created", "pane_closed", "pane_exited", "pane_agent_detected", "workspace_created",
+                   "workspace_closed", "worktree_created", "worktree_opened", "worktree_removed"}
+
+
+def herdr(*args):
+    try:
+        out = subprocess.run(["herdr", *args], capture_output=True, text=True, timeout=30)
+        return json.loads(out.stdout)["result"] if out.returncode == 0 else None
+    except (OSError, subprocess.TimeoutExpired, ValueError, KeyError):
+        return None
+
+
+class Events:
+    """Herdr event subscription; agent status needs one subscription per pane, so resubscribe on topology changes."""
+
+    def __init__(self):
+        self.sock, self.buf, self.panes = None, b"", ()
+
+    @staticmethod
+    def agent_panes():
+        agents = (herdr("agent", "list") or {}).get("agents", [])
+        return tuple(sorted(a["pane_id"] for a in agents))
+
+    def connect(self):
+        self.close()
+        for _ in range(3):
+            panes = self.agent_panes()
+            subs = [{"type": t} for t in GLOBAL_EVENTS]
+            subs += [{"type": "pane.agent_status_changed", "pane_id": p} for p in panes]
+            sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            try:
+                sock.connect(os.environ.get("HERDR_SOCKET_PATH", str(Path.home() / ".config/herdr/herdr.sock")))
+                request = {"id": "orch-watch", "method": "events.subscribe", "params": {"subscriptions": subs}}
+                sock.sendall((json.dumps(request) + "\n").encode())
+                sock.settimeout(5)
+                reply, buf = self._first_line(sock)
+            except (OSError, ValueError):
+                sock.close()
+                return False
+            if "result" in reply:
+                sock.setblocking(False)
+                self.sock, self.buf, self.panes = sock, buf, panes
+                return True
+            sock.close()  # A pane closed between listing and subscribing; list again.
+            time.sleep(0.5)
+        return False
+
+    @staticmethod
+    def _first_line(sock):
+        buf = b""
+        while b"\n" not in buf:
+            chunk = sock.recv(65536)
+            if not chunk:
+                raise OSError("closed")
+            buf += chunk
+        line, rest = buf.split(b"\n", 1)
+        return json.loads(line), rest
+
+    def close(self):
+        if self.sock:
+            self.sock.close()
+        self.sock = None
+
+    def read(self):
+        try:
+            chunk = self.sock.recv(65536)
+        except BlockingIOError:
+            return []
+        except OSError:
+            chunk = b""
+        if not chunk:
+            self.close()
+            return []
+        self.buf += chunk
+        events = []
+        while b"\n" in self.buf:
+            line, self.buf = self.buf.split(b"\n", 1)
+            try:
+                message = json.loads(line)
+            except ValueError:
+                continue
+            if "event" in message:
+                events.append(message)
+        return events
+
+    def stale(self):
+        return self.agent_panes() != self.panes
+
+
+def kind(event):
+    """Event names come as pane_created or pane.agent_status_changed; use the underscore form."""
+    return str(event.get("event", "")).replace(".", "_")
+
+
+def describe(event):
+    data = event.get("data") or {}
+    if kind(event) == "pane_agent_status_changed":
+        return f"{data.get('pane_id')} {data.get('agent_status')}"
+    return kind(event).replace("_", " ")
+
+
+def focused_workspace(event):
+    data = event.get("data") or {}
+    return data.get("workspace_id") or (data.get("workspace") or {}).get("workspace_id")
+
+
+class Watch:
+    def __init__(self):
+        self.events = Events()
+        self.pending_event_at = None
+        self.resubscribe = False
+        self.last_event = ""
+        self.next_tick = 0.0
+        self.next_reconnect = 0.0
+        self.prompt_pending_since = None
+        self.note = ""
+        self.overrides_mtime = self.mtime(OVERRIDES)
+
+    @staticmethod
+    def mtime(path):
+        try:
+            return path.stat().st_mtime
+        except OSError:
+            return None
+
+    # ------------------------------------------------------------- refresh
+
+    def refresh(self, mode):
+        cols = shutil.get_terminal_size((80, 24)).columns
+        args = [str(STATUS), "--sidebar", "--notify", "--refresh-todo", "--ttl", str(max(TICK * 10, 900)),
+                "--width", str(cols)] + (["--kind"] if SETTINGS["kind_tags"] else [])
+        if mode == "event":
+            args.append("--cached")
+        elif mode == "full":
+            args += ["--max-age", "0"]
+        started = time.time()
+        proc = subprocess.run(args, capture_output=True, text=True, env=dict(os.environ, ORCH_COLOR="1"))
+        board = proc.stdout if proc.returncode == 0 else (proc.stdout + proc.stderr)
+        live = "live" if self.events.sock else "polling (no Herdr events)"
+        footer = (f"\033[2m {datetime.now():%H:%M:%S} · {live} · {mode} refresh {time.time() - started:.1f}s"
+                  " · enter = refetch all")
+        if self.last_event:
+            footer += f" · last event: {self.last_event}"
+        if self.note:
+            footer += f"\n {self.note}"
+        sys.stdout.write("\033[H\033[2J\n" + board.rstrip() + "\n\n" + footer + "\033[0m")
+        sys.stdout.flush()
+
+    # ------------------------------------------------------------ briefings
+
+    @staticmethod
+    def state():
+        try:
+            return json.loads(WATCH_STATE.read_text())
+        except (OSError, ValueError):
+            return {}
+
+    @staticmethod
+    def save_state(**updates):
+        state = Watch.state()
+        state.update(updates)
+        WATCH_STATE.parent.mkdir(parents=True, exist_ok=True)
+        WATCH_STATE.write_text(json.dumps(state))
+
+    def maybe_briefing(self, trigger):
+        now = datetime.now()
+        if now.weekday() >= 5 or (BRIEFINGS / f"{date.today().isoformat()}.md").exists():
+            return
+        if trigger == "time" and now.strftime("%H:%M") < BRIEFING_AT:
+            return
+        if trigger == "open" and now.hour < 6:
+            return
+        subprocess.run([str(STATUS), "--briefing", "--cached"], capture_output=True, text=True)
+        self.prompt_pending_since = time.time()
+        self.note = f"briefing written ({trigger}); asking {ORCHESTRATOR} to fill in Focus today"
+        self.pump_prompt()
+
+    def pump_prompt(self):
+        """Ask the orchestrator for /briefing once it is idle with an empty input box."""
+        if self.prompt_pending_since is None:
+            return
+        if time.time() - self.prompt_pending_since > PROMPT_GIVE_UP:
+            self.prompt_pending_since = None
+            self.note = f"briefing skeleton is ready; {ORCHESTRATOR} was busy, run /briefing there"
+            return
+        agent = herdr("agent", "get", ORCHESTRATOR)
+        if not agent or not re.search(r'"agent_status": "(idle|done)"', json.dumps(agent)):
+            return
+        screen = subprocess.run(["herdr", "agent", "read", ORCHESTRATOR, "--source", "visible", "--lines", "15"],
+                                capture_output=True, text=True).stdout
+        if not re.search(r"^❯[\s ]*$", screen, flags=re.M):
+            return  # Something is typed in the input box; do not submit over it.
+        result = subprocess.run(["herdr", "agent", "prompt", ORCHESTRATOR, "/briefing"], capture_output=True)
+        if result.returncode == 0:
+            self.prompt_pending_since = None
+            self.note = f"{ORCHESTRATOR} is writing today's briefing"
+
+    def maybe_what_moved(self):
+        now = datetime.now()
+        today = date.today().isoformat()
+        if now.weekday() >= 5 or now.strftime("%H:%M") < WHAT_MOVED_AT or self.state().get("what_moved") == today:
+            return
+        subprocess.run([str(STATUS), "--what-moved"], capture_output=True, text=True)
+        self.save_state(what_moved=today)
+        self.note = "What moved today added to today's briefing"
+
+    # ----------------------------------------------------------------- loop
+
+    def run(self):
+        self.events.connect()
+        while True:
+            now = time.time()
+            wakeups = [self.next_tick] + ([self.pending_event_at] if self.pending_event_at else [])
+            readers = [sys.stdin] + ([self.events.sock] if self.events.sock else [])
+            ready, _, _ = select.select(readers, [], [], min(max(min(wakeups) - now, 0), 2))
+            # Parking or snoozing from the popup (or by hand) should show without waiting for the tick.
+            mtime = self.mtime(OVERRIDES)
+            if mtime != self.overrides_mtime:
+                self.overrides_mtime = mtime
+                self.last_event = f"overrides.toml changed {datetime.now():%H:%M:%S}"
+                self.pending_event_at = self.pending_event_at or time.time() + 0.3
+
+            if sys.stdin in ready:
+                sys.stdin.readline()
+                self.refresh("full")
+                self.next_tick = time.time() + TICK
+                continue
+            if self.events.sock and self.events.sock in ready:
+                for event in self.events.read():
+                    self.last_event = f"{describe(event)} {datetime.now():%H:%M:%S}"
+                    if kind(event) == "workspace_focused" and focused_workspace(event) == OWN_WORKSPACE:
+                        self.maybe_briefing("open")
+                    if kind(event) in TOPOLOGY_EVENTS:
+                        self.resubscribe = True
+                    self.pending_event_at = self.pending_event_at or time.time() + DEBOUNCE
+
+            now = time.time()
+            if self.pending_event_at and now >= self.pending_event_at:
+                self.pending_event_at = None
+                self.refresh("event")
+                if self.resubscribe and self.events.stale():
+                    self.events.connect()
+                self.resubscribe = False
+            if now >= self.next_tick:
+                if not self.events.sock and now >= self.next_reconnect:
+                    self.events.connect()
+                    self.next_reconnect = now + 30
+                self.maybe_briefing("time")
+                self.maybe_what_moved()
+                self.pump_prompt()
+                self.refresh("tick")
+                self.next_tick = time.time() + TICK
+
+
+if __name__ == "__main__":
+    try:
+        Watch().run()
+    except KeyboardInterrupt:
+        print()

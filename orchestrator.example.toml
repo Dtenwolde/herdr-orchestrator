@@ -1,0 +1,22 @@
+# Optional settings for herdr-status, orch-watch and orch-pick.
+# Copy to orchestrator.toml (git-ignored) and change what you need; everything has a default.
+
+# Where your git worktrees live. Only used to infer r/b/f kind tags from paths like
+# <worktree_root>/bug/foo (see kind_tags).
+# worktree_root = "~/git/worktrees"
+
+# Branches that never have a PR of their own (regex).
+# base_branches = '^(main|master|develop|trunk|v\d+\.\d+.*)$'
+
+# Extra GitHub logins whose comments never count as feedback (logins ending in [bot] never do).
+# bots = ["my-ci-bot"]
+
+# Restore r/b/f workspace kind tags (sidebar token $kind) inferred from branch or path prefixes
+# such as pr/, review-, bug/, fix/, feat/. Herdr drops workspace metadata on a server restart.
+# kind_tags = false
+
+[watch]
+# interval = 60            # seconds between ticks; Herdr events refresh in between
+# briefing_at = "09:00"    # weekday briefing (or when you open the orchestrator workspace)
+# what_moved_at = "18:00"  # end-of-day "What moved today"
+# agent = "orchestrator"   # Herdr agent name of the orchestrator Claude session
