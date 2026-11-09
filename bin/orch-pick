@@ -37,19 +37,20 @@ def load_units():
     units = json.loads(hs.ITEMS_FILE.read_text())["units"]
     overrides, _ = hs.load_overrides()
     hs.rank(units, overrides)
-    return [u for u in units if not (u.get("inbox") and u["priority"] == hs.QUIET)], overrides
+    return [u for u in units if not ((u.get("inbox") and u["priority"] == hs.QUIET)
+                                     or (u.get("board") and not hs.visible_items(u)))], overrides
 
 
 def target(unit):
     """The overrides.toml table an action on this line edits."""
-    if unit.get("inbox"):
+    if unit.get("inbox") or unit.get("board"):
         return "pr", unit["pr"]["key"]
     return "workspace", unit["workspace"]
 
 
 def line(index, unit):
-    prio = "INBOX" if hs.in_inbox(unit) else hs.PRIO_NAMES[unit["priority"]]
-    color = "pink" if prio == "INBOX" else hs.PRIO_COLORS[unit["priority"]]
+    prio = "INBOX" if hs.in_inbox(unit) else "BOARD" if hs.in_board(unit) else hs.PRIO_NAMES[unit["priority"]]
+    color = {"INBOX": "pink", "BOARD": "purple"}.get(prio) or hs.PRIO_COLORS[unit["priority"]]
     items = hs.visible_items(unit)
     top = items[0] if items else None
     icon, icon_color = hs.KIND_ICONS.get(top["kind"], ("-", "comment")) if top else (" ", None)
@@ -107,7 +108,7 @@ def act(key, unit):
     """Run one action; returns a status line to show when the list reopens, or None to close the popup."""
     section, name = target(unit)
     url = (unit.get("pr") or {}).get("url")
-    if key == "ctrl-o" or (not key and unit.get("inbox")):
+    if key == "ctrl-o" or (not key and (unit.get("inbox") or unit.get("board"))):
         if url:
             webbrowser.open(url)
         return None

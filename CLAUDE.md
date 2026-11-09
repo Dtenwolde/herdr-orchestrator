@@ -32,6 +32,9 @@ lives in `CLAUDE.local.md` when the user has one.
   commented after the user. Items a workspace claims (its PR description, or `links`) show on that
   workspace's card instead. Inbox units have `inbox: true` and ids `gh:<owner/repo>#<n>:<kind>`.
 - Priorities: NOW, SOON, RUNNING (CI running, agents working), WAITING, CLEANUP, QUIET, PARKED.
+- Project boards (`[[projects]]` in `orchestrator.toml`): review items become inbox units with kind
+  `review-owed` (keyed by the PR a tracker issue mirrors); other items are units with `board: true`,
+  `project` and a `status`, shown in their own section. Items a workspace claims sit on its card.
 - GitHub and remote data are cached in `state/cache.json` (90 s while CI runs, 5 min for open PRs,
   1 h for merged ones; a new commit invalidates). Add `--cached` for an instant read, `--max-age 0`
   to refetch everything.

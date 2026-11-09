@@ -15,6 +15,20 @@
 # such as pr/, review-, bug/, fix/, feat/. Herdr drops workspace metadata on a server restart.
 # kind_tags = false
 
+# GitHub Projects boards to include. Items marked as code review join the inbox as "review owed"
+# (or the card of your review worktree); everything else gets a compact section per board. Items a
+# workspace handles show on its card. Needs the read:project scope: gh auth refresh -s read:project
+#
+# [[projects]]
+# owner = "my-org"                  # organization or user
+# number = 7                        # from https://github.com/orgs/my-org/projects/7
+# view = 2                          # use this view's filter; or set filter = "assignee:@me -status:Done"
+# status_field = "Status"           # single-select field shown as the status (default Status)
+# review_field = "Type"             # single-select field that marks review items...
+# review_value = "Code Review"      # ...when it has this value (pull requests by others always count)
+# blocked_statuses = ["Blocked"]    # review items in these statuses rank WAITING instead of SOON
+# collapsed_statuses = ["Long-running"]  # shown as one line
+
 [watch]
 # interval = 60            # seconds between ticks; Herdr events refresh in between
 # briefing_at = "09:00"    # weekday briefing (or when you open the orchestrator workspace)

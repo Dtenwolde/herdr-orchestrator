@@ -39,6 +39,7 @@ CONFIG_DEFAULTS = {
     "base_branches": r"^(main|master|develop|trunk|v\d+\.\d+.*)$",  # branches that never have their own PR
     "bots": [],  # extra GitHub logins whose comments never count as feedback
     "kind_tags": False,  # restore r/b/f workspace kind tags (sidebar token $kind)
+    "projects": [],  # GitHub Projects boards to read, see orchestrator.example.toml
     "watch": {"interval": 60, "briefing_at": "09:00", "what_moved_at": "18:00", "agent": "orchestrator"},
 }
 WORKTREE_ROOT = None
@@ -56,6 +57,9 @@ CACHE_FILE = STATE_DIR / "cache.json"
 HISTORY_FILE = STATE_DIR / "history.jsonl"
 REMOTE_TTL = 120
 INBOX_TTL = 300
+PROJECT_TTL = 300
+STATUS_COLORS = {"in progress": "cyan", "todo": "yellow", "under review": "purple", "blocked": "red",
+                 "triaging": "orange", "new": "orange"}
 TOKEN_SOURCE = "custom:orch"
 TOKENS = ("ci", "pr", "fb")
 
@@ -330,7 +334,8 @@ def ci_summary(rollup):
 
 
 def is_human(login, me):
-    return bool(login) and login != me and not login.endswith("[bot]") and login not in BOTS
+    """Not you and not a bot: GitHub Apps end in [bot], bot accounts usually in -bot."""
+    return (bool(login) and login != me and not login.endswith(("[bot]", "-bot")) and login not in BOTS)
 
 
 def pr_detail(pr, me):
@@ -817,18 +822,30 @@ def inbox_units(raw, workspace_keys):
     return units
 
 
-def load_inbox(cache, units, warnings, overrides, me):
-    """Inbox units; items claimed by a workspace (PR description or `links` override) move onto its card."""
-    workspace_keys = {u["pr"]["key"] for u in units if u.get("pr") and u["pr"].get("key")}
+def workspace_claims(units, overrides):
+    """issue/PR key -> the workspace unit that handles it: its own PR, references in its PR description,
+    or `links` in overrides.toml."""
     claims = {}
     for unit in units:
+        if unit.get("inbox") or unit.get("board"):
+            continue
         for ref in (unit.get("pr") or {}).get("refs") or []:
             claims.setdefault(ref, unit)
-    by_label = {u["workspace"]: u for u in units}
+    by_label = {u["workspace"]: u for u in units if not u.get("inbox") and not u.get("board")}
     for label, entry in overrides["workspace"].items():
         for ref in entry.get("links", []):
             if label in by_label:
                 claims[ref] = by_label[label]
+    for unit in by_label.values():
+        if (unit.get("pr") or {}).get("key"):
+            claims[unit["pr"]["key"]] = unit
+    return claims
+
+
+def load_inbox(cache, units, warnings, overrides, me):
+    """Inbox units; items claimed by a workspace (PR description or `links` override) move onto its card."""
+    workspace_keys = {u["pr"]["key"] for u in units if u.get("pr") and u["pr"].get("key")}
+    claims = workspace_claims(units, overrides)
     hit, raw = cache.get("inbox", INBOX_TTL)
     if not hit:
         try:
@@ -847,6 +864,163 @@ def load_inbox(cache, units, warnings, overrides, me):
         for item in unit["items"]:
             owner["items"].append(dict(item, text=f"{key}: {item['text']}", linked=key, url=unit["pr"]["url"]))
     return inbox
+
+
+# ------------------------------------------------------------- project boards
+
+
+def gh_graphql(query, **variables):
+    cmd = ["gh", "api", "graphql", "-f", f"query={query}"]
+    for name, value in variables.items():
+        if value is not None:
+            cmd += ["-F" if isinstance(value, int) else "-f", f"{name}={value}"]
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+        data = json.loads(proc.stdout or "{}")
+    except (OSError, subprocess.TimeoutExpired, ValueError):
+        raise GhError("graphql")
+    if not data.get("data"):
+        raise GhError(((data.get("errors") or [{}])[0]).get("message", "graphql"))
+    return data["data"]
+
+
+PROJECT_ITEMS = """
+query($o: String!, $n: Int!, $q: String!, $after: String, $sf: String!, $rf: String!) {
+  OWNER(login: $o) { projectV2(number: $n) { items(first: 100, after: $after, query: $q) {
+    pageInfo { hasNextPage endCursor }
+    nodes {
+      updatedAt
+      status: fieldValueByName(name: $sf) { ... on ProjectV2ItemFieldSingleSelectValue { name } }
+      review: fieldValueByName(name: $rf) { ... on ProjectV2ItemFieldSingleSelectValue { name } }
+      content {
+        __typename
+        ... on Issue { number title url state repository { nameWithOwner } }
+        ... on PullRequest { number title url state repository { nameWithOwner } author { login } }
+      }
+    }
+  } } }
+}"""
+
+
+def fetch_project(cfg):
+    """Title, status order and the items of one board, filtered like the configured view."""
+    owner, number = cfg["owner"], int(cfg["number"])
+    status_field = cfg.get("status_field", "Status")
+    view = f"view(number: {int(cfg['view'])}) {{ name filter }}" if cfg.get("view") else ""
+    meta, kind = None, None
+    for kind in ("organization", "user"):
+        try:
+            meta = gh_graphql(f"query($o: String!, $n: Int!, $sf: String!) {{ {kind}(login: $o) {{ projectV2(number: $n) "
+                              f"{{ title url {view} field(name: $sf) {{ ... on ProjectV2SingleSelectField "
+                              f"{{ options {{ name }} }} }} }} }} }}", o=owner, n=number, sf=status_field)
+            meta = (meta.get(kind) or {}).get("projectV2")
+            if meta:
+                break
+        except GhError:
+            meta = None
+    if not meta:
+        raise GhError(f"project {owner}/{number} not found (does gh have the read:project scope?)")
+    query = cfg.get("filter") or (meta.get("view") or {}).get("filter") or "assignee:@me -status:Done"
+    items, after = [], None
+    for _ in range(5):
+        data = gh_graphql(PROJECT_ITEMS.replace("OWNER", kind), o=owner, n=number, q=query, after=after,
+                          sf=status_field, rf=cfg.get("review_field") or status_field)
+        page = data[kind]["projectV2"]["items"]
+        for node in page["nodes"]:
+            content = node.get("content") or {}
+            if not content.get("number"):
+                continue  # draft issues have no link to open
+            repo = content["repository"]["nameWithOwner"]
+            items.append({"key": f"{repo}#{content['number']}", "repo": repo, "number": content["number"],
+                          "title": content["title"], "url": content["url"], "type": content["__typename"],
+                          "author": (content.get("author") or {}).get("login"),
+                          "status": (node.get("status") or {}).get("name") or "No status",
+                          "review": (node.get("review") or {}).get("name"), "updated": node.get("updatedAt")})
+        if not page["pageInfo"]["hasNextPage"]:
+            break
+        after = page["pageInfo"]["endCursor"]
+    statuses = [o["name"] for o in ((meta.get("field") or {}).get("options") or [])]
+    return {"title": meta["title"], "url": meta["url"], "owner": owner, "statuses": statuses, "items": items}
+
+
+def project_units(project, cfg, units, claims, me):
+    """Review items join the inbox (or the card of the review worktree); everything else becomes a board unit."""
+    title = project["title"]
+    blocked = {s.lower() for s in cfg.get("blocked_statuses", ["Blocked"])}
+    by_key = {u["pr"]["key"]: u for u in units if u.get("inbox") and u.get("pr")}
+    new_units = []
+    for it in project["items"]:
+        status = it["status"]
+        is_review = (cfg.get("review_value") and it.get("review") == cfg["review_value"]) or (
+            it["type"] == "PullRequest" and it.get("author") not in (None, me))
+        if is_review:
+            mirrored = mirrored_key(it["title"])
+            key = mirrored or it["key"]
+            name = re.sub(r"^\[[^\]]+\]\s*", "", it["title"]) if mirrored else it["title"]
+            url = f"https://github.com/{key.split('#')[0]}/pull/{key.split('#')[1]}" if mirrored else it["url"]
+            prio = WAITING if status.lower() in blocked else SOON
+            reason = f"review owed ({title}: {status})"
+            tracker = by_key.get(it["key"]) if mirrored else None
+            item = {"id": f"gh:{key}:review-owed", "kind": "review-owed", "base_priority": prio,
+                    "text": f"{reason}: {name}", "reason": reason, "status": status,
+                    "alert": f"gh:{key}:review-owed" if prio == SOON else None}
+            if key in claims:
+                claims[key]["items"].append(dict(item, base_priority=QUIET, alert=None, linked=key,
+                                                 text=f"{title}: code review {status}"))
+            elif key in by_key:
+                by_key[key]["items"].append(item)
+            else:
+                unit = None
+                unit = {"workspace": key, "workspace_id": None, "inbox": True, "path": None, "machine": None,
+                        "agents": [], "git": None, "tokens": {}, "linked_worktree": False,
+                        "active_at": parse_ts(it["updated"]),
+                        "pr": {"key": key, "number": int(key.split("#")[1]), "title": name, "url": url,
+                               "state": "OPEN", "type": "pr", "ci": {"state": None}},
+                        "items": [item]}
+                by_key[key] = unit
+                new_units.append(unit)
+            target = claims.get(key) or by_key.get(key)
+            if tracker is not None and target is not None and tracker is not target:
+                target["items"] += [dict(i, text=f"{it['key']}: {i['text']}", url=it["url"]) for i in tracker["items"]]
+                tracker["merged_into"] = key
+            continue
+        key = it["key"]
+        item = {"id": f"gh:{key}:board", "kind": "board", "base_priority": QUIET, "status": status,
+                "text": f"{title} · {status}: {it['title']}", "reason": status, "alert": None}
+        if key in claims:
+            claims[key]["items"].append(dict(item, linked=key, url=it["url"], text=f"{title} · {status}: {it['title']}"))
+            continue
+        order = project["statuses"].index(status) if status in project["statuses"] else len(project["statuses"])
+        new_units.append({
+            "workspace": key, "workspace_id": None, "board": True, "project": title, "status_rank": order,
+            "project_owner": project["owner"],
+            "collapsed": status in cfg.get("collapsed_statuses", []), "path": None, "machine": None,
+            "agents": [], "git": None, "tokens": {}, "linked_worktree": False, "active_at": parse_ts(it["updated"]),
+            "pr": {"key": key, "number": it["number"], "title": it["title"], "url": it["url"], "state": "OPEN",
+                   "type": "issue" if it["type"] == "Issue" else "pr", "ci": {"state": None}},
+            "items": [item]})
+    return new_units
+
+
+def load_projects(cache, units, warnings, overrides, me, projects):
+    claims = workspace_claims(units, overrides)
+    added = []
+    for cfg in projects:
+        if not cfg.get("owner") or not cfg.get("number"):
+            warnings.append("orchestrator.toml: every [[projects]] entry needs owner and number")
+            continue
+        key = f"project:{cfg['owner']}/{cfg['number']}/{cfg.get('view') or cfg.get('filter') or ''}"
+        hit, project = cache.get(key, PROJECT_TTL)
+        if not hit:
+            try:
+                project = fetch_project(cfg)
+                cache.put(key, project)
+            except GhError as error:
+                project = cache.stale(key)
+                warnings.append(f"{cfg['owner']}/{cfg['number']}: {error}" + (", showing the last result" if project else ""))
+        if project:
+            added += project_units(project, cfg, units + added, claims, me)
+    return added
 
 
 # ------------------------------------------------------------------ overrides
@@ -1049,13 +1223,18 @@ def visible_items(unit):
             if i["state"] != "ignored" and i["kind"] not in HIDDEN_KINDS]
 
 
+def in_board(unit):
+    """Project board items in their own section; parked ones show under PARKED, dismissed ones nowhere."""
+    return bool(unit.get("board")) and unit["priority"] != PARKED and bool(visible_items(unit))
+
+
 def in_inbox(unit):
     """Open inbox items; parked ones show under PARKED, dismissed ones (done) nowhere."""
     return bool(unit.get("inbox")) and unit["priority"] not in (PARKED, QUIET)
 
 
 def on_board(unit):
-    return not unit.get("inbox") or unit["priority"] == PARKED
+    return (not unit.get("inbox") and not unit.get("board")) or unit["priority"] == PARKED
 
 
 # --------------------------------------------------------------------- output
@@ -1079,7 +1258,7 @@ KIND_ICONS = {
     "pr-merged": ("⊕", "purple"), "pr-closed": ("⊘", "comment"), "unpushed": ("↑", "orange"),
     "stale-changes": ("±", "orange"), "mentioned": ("@", "pink"), "assigned": ("◆", "pink"),
     "issue-activity": ("✎", "comment"), "merge-queued": ("↠", "cyan"), "dequeued": ("✗", "red"),
-    "merge-queue-failed": ("✗", "red"),
+    "merge-queue-failed": ("✗", "red"), "review-owed": ("↻", "orange"), "board": ("▦", "comment"),
 }
 CI_ICONS = {"fail": ("✗", "red"), "pending": ("…", "yellow"), "pass": ("✓", "green")}
 ANSI = re.compile(r"\033\[[0-9;]*m|\033\]8;;[^\033]*\033\\")
@@ -1199,6 +1378,46 @@ def inbox_card(unit, width):
     return lines
 
 
+def board_sections(units, width):
+    """One compact section per project board: a line per item, grouped by status in the board's order."""
+    lines = []
+    for project in sorted({u["project"] for u in units}):
+        group = sorted((u for u in units if u["project"] == project),
+                       key=lambda u: (u.get("status_rank") or 0, -(u.get("active_at") or 0)))
+        lines.append(rule(project.upper(), len(group), "purple", width))
+        key_width = min(max(len(short_key(u["pr"]["key"], u)) for u in group), 26)
+        status_width = min(max(len(u["items"][0].get("status") or "") for u in group), 14)
+        shown_status = None
+        collapsed = {}
+        for u in group:
+            status = u["items"][0].get("status") or ""
+            if u.get("collapsed"):
+                collapsed.setdefault(status, []).append(u)
+                continue
+            label = f"{status:<{status_width}}" if status != shown_status else " " * status_width
+            shown_status = status
+            key = short_key(u["pr"]["key"], u)
+            room = width - status_width - key_width - 5
+            lines.append(f" {paint(clip(label, status_width), STATUS_COLORS.get(status.lower(), 'comment'))} "
+                         f"{paint(link(f'{key:<{key_width}}'[:key_width], u['pr']['url']), 'comment')} "
+                         f"{clip(u['pr']['title'], room)}")
+            for note in u.get("notes", []):
+                lines.append(" " * (status_width + 2) + paint(clip(f"» {note}", width - status_width - 3), "comment",
+                                                               italic=True))
+        for status, members in collapsed.items():
+            keys = ", ".join(short_key(u["pr"]["key"], u) for u in members)
+            lines.append(f" {paint(clip(status, status_width), 'comment')} "
+                         f"{paint(clip(f'{len(members)}: {keys}', width - status_width - 3), 'comment')}")
+        lines.append("")
+    return lines
+
+
+def short_key(key, unit):
+    """Drop the owner when it is the board's own organisation: duckdb-internal#11584."""
+    owner, _, rest = key.partition("/")
+    return rest if unit.get("board") and owner.lower() == (unit.get("project_owner") or "").lower() else key
+
+
 def rule(name, count, color, width):
     label = f" {name} "
     tail = f" {count} "
@@ -1211,6 +1430,7 @@ def render_text(units, width, warnings=()):
     width = max(min(width, 100), 36)
     color = sys.stdout.isatty() or bool(os.environ.get("ORCH_COLOR"))
     inbox = [u for u in units if in_inbox(u)]
+    boards = [u for u in units if in_board(u)]
     board = [u for u in units if on_board(u)]
     counts = {prio: sum(1 for u in board if u["priority"] == prio) for prio in PRIO_NAMES}
 
@@ -1220,6 +1440,7 @@ def render_text(units, width, warnings=()):
 
     chips = [chip(NOW), chip(SOON),
              paint("◆", "pink") + " " + paint(f"{len(inbox)} inbox", None if inbox else "comment"),
+             *([paint("▦", "purple") + " " + paint(f"{len(boards)} board")] if boards else []),
              chip(RUNNING), chip(WAITING), chip(CLEANUP),
              paint(f"○ {counts[PARKED]} parked · {counts[QUIET]} quiet", "comment")]
     lines, row = [], " "
@@ -1248,8 +1469,10 @@ def render_text(units, width, warnings=()):
         lines.append(rule("INBOX", len(inbox), "pink", width))
         for u in inbox:
             lines.extend(inbox_card(u, width) + [""])
-    for prio in (RUNNING, WAITING, CLEANUP, PARKED):
+    for prio in (RUNNING, WAITING, CLEANUP):
         section(prio)
+    lines.extend(board_sections([u for u in units if in_board(u)], width))
+    section(PARKED)
     quiet = [u for u in board if u["priority"] == QUIET]
     if quiet:
         lines.append(rule("QUIET", len(quiet), "comment", width))
@@ -1271,7 +1494,7 @@ def render_text(units, width, warnings=()):
 def sidebar_tokens(units):
     by_ws = {}
     for u in units:
-        if u.get("machine") or u.get("inbox"):
+        if u.get("machine") or u.get("inbox") or u.get("board"):
             continue
         tokens = by_ws.setdefault(u["workspace_id"], {})
         pr = u.get("pr")
@@ -1318,7 +1541,7 @@ def restore_kinds(units):
     """Workspace metadata is lost on a Herdr server restart; put the r/b/f tag back where it can be inferred."""
     done = set()
     for u in units:
-        if (u.get("machine") or u.get("inbox") or u["workspace_id"] in done or "kind" in u["tokens"]
+        if (u.get("machine") or u.get("inbox") or u.get("board") or u["workspace_id"] in done or "kind" in u["tokens"]
                 or not u["linked_worktree"] or not u["path"]):
             continue
         done.add(u["workspace_id"])
@@ -1380,16 +1603,19 @@ def write_items(units, warnings):
     """Raw items (before overrides) with the unit context overrides and TODO.md need."""
     write_json(ITEMS_FILE, {"generated": time.time(), "warnings": warnings, "units": [{
         "workspace": u["workspace"], "workspace_id": u["workspace_id"], "machine": u.get("machine"),
-        "machine_id": u.get("machine_id"), "inbox": bool(u.get("inbox")), "path": u["path"], "active_at": u.get("active_at"),
+        "machine_id": u.get("machine_id"), "inbox": bool(u.get("inbox")), "board": bool(u.get("board")),
+        "project": u.get("project"), "status_rank": u.get("status_rank"), "collapsed": u.get("collapsed"),
+        "project_owner": u.get("project_owner"), "path": u["path"], "active_at": u.get("active_at"),
         "remotes": [r["workspace"] for r in u.get("remotes", [])],
         "pr": {k: u["pr"].get(k) for k in ("key", "number", "title", "url", "state", "type")} if u.get("pr") else None,
-        "items": [{k: i.get(k) for k in ("id", "kind", "base_priority", "text", "reason", "source", "alert", "url")}
+        "items": [{k: i.get(k) for k in ("id", "kind", "base_priority", "text", "reason", "source", "alert", "url",
+                                         "status")}
                   for i in u["items"]],
     } for u in units]})
 
 
 TODO_SECTIONS = (("Now", (NOW,)), ("Soon", (SOON,)), ("Inbox", ()), ("Running", (RUNNING,)),
-                 ("Waiting", (WAITING,)), ("Cleanup", (CLEANUP,)), ("Parked", (PARKED,)))
+                 ("Waiting", (WAITING,)), ("Cleanup", (CLEANUP,)), ("Board", ()), ("Parked", (PARKED,)))
 TODO_HEADINGS = {name for name, _ in TODO_SECTIONS} | {"Notes", "Done"}
 DONE_KEEP = 20
 
@@ -1421,13 +1647,15 @@ def todo_lines(units):
         for item in visible_items(unit):
             if in_inbox(unit):
                 section = "Inbox"
+            elif in_board(unit):
+                section = "Board"
             else:
                 section = next((name for name, prios in TODO_SECTIONS if item["priority"] in prios), None)
             if section is None:
                 continue
             line = f"- [{unit['workspace']}] {item_text(item)}"
             pr = unit.get("pr") or {}
-            if pr.get("url") and (unit.get("inbox") or f"#{pr['number']}" in item["text"]):
+            if pr.get("url") and (unit.get("inbox") or unit.get("board") or f"#{pr['number']}" in item["text"]):
                 line += f" ({pr['url']})"
             listed[item["id"]] = f"[{unit['workspace']}] {item['text']}"
             lines[section].append(f"{line} <!-- {item['id']} -->")
@@ -1489,8 +1717,15 @@ def render_todo(quiet=False):
     appeared = {} if first_render else {item_id: text for item_id, text in listed.items()
                                         if item_id not in previous and kind_of(item_id) not in TRANSIENT_KINDS}
     now = time.time()
+    statuses = {i["id"]: i.get("status") for u in units for i in u["items"] if i.get("status")}
+    previous_statuses = {} if first_render else json.loads(TODO_STATE.read_text()).get("statuses", {})
+    labels = {i["id"]: u["workspace"] for u in units for i in u["items"]}
+    moved = [{"ts": now, "event": "moved", "id": i, "kind": kind_of(i),
+              "text": f"[{labels[i]}] {previous_statuses[i]} → {status}"}
+             for i, status in statuses.items() if previous_statuses.get(i) not in (None, status)]
     append_history([{"ts": now, "event": "done", "id": i, "kind": kind_of(i), "text": t} for i, t in finished.items()]
-                   + [{"ts": now, "event": "new", "id": i, "kind": kind_of(i), "text": t} for i, t in appeared.items()])
+                   + [{"ts": now, "event": "new", "id": i, "kind": kind_of(i), "text": t} for i, t in appeared.items()]
+                   + moved)
     today = date.today().isoformat()
     done = [f"- {today} {text}" for text in finished.values()]
     done += [line for line in sections.get("Done", []) if line.startswith("- ")]
@@ -1513,7 +1748,7 @@ def render_todo(quiet=False):
     tmp = TODO_FILE.with_suffix(f".md.{os.getpid()}.tmp")
     tmp.write_text(text)
     tmp.replace(TODO_FILE)
-    write_json(TODO_STATE, {"rendered": now, "items": listed})
+    write_json(TODO_STATE, {"rendered": now, "items": listed, "statuses": statuses})
     if not quiet:
         summary = ", ".join(f"{n} {name.lower()}" for name, n in counts.items() if n)
         print(f"{TODO_FILE}: {summary or 'nothing open'}" + (f"; {len(finished)} moved to done" if finished else ""))
@@ -1532,13 +1767,17 @@ def moved_lines(entries):
     """Net change per item over the entries: merged or closed, resolved, and new."""
     last = {}
     for entry in entries:
-        last[entry["id"]] = entry
+        if entry["event"] != "moved":
+            last[entry["id"]] = entry
     merged = [e for e in last.values() if e["event"] == "new" and e["kind"] in ("pr-merged", "pr-closed")]
     resolved = [e for e in last.values() if e["event"] == "done" and e["kind"] not in ("pr-merged", "pr-closed")]
     new = [e for e in last.values() if e["event"] == "new" and e["kind"] not in ("pr-merged", "pr-closed")]
+    moves = [e for e in entries if e["event"] == "moved"]
     lines = []
     for title, group in (("Merged or closed", merged), ("Resolved", resolved), ("New", new)):
         lines += [f"### {title}", ""] + ([f"- {e['text']}" for e in group] or ["- nothing"]) + [""]
+    if moves:
+        lines += ["### Board moves", ""] + [f"- {e['text']}" for e in moves] + [""]
     return lines
 
 
@@ -1702,7 +1941,7 @@ def main():
         write_what_moved()
         return
 
-    _, config_warnings = load_config()
+    config, config_warnings = load_config()
     workspaces = (herdr("workspace", "list") or {}).get("workspaces", [])
     agents = (herdr("agent", "list") or {}).get("agents", [])
     panes = (herdr("pane", "list") or {}).get("panes", [])
@@ -1732,6 +1971,8 @@ def main():
     overrides, override_warnings = load_overrides()
     if not args.workspace and not args.no_inbox:
         units += load_inbox(cache, units, warnings, overrides, me)
+        units += load_projects(cache, units, warnings, overrides, me, config.get("projects") or [])
+        units = [u for u in units if not u.get("merged_into")]
 
     full = not args.workspace and not args.local
     if full:

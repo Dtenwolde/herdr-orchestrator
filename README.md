@@ -43,6 +43,9 @@ you a briefing every weekday morning.
 - **Your GitHub inbox**: pending review requests, unread mentions and assignments, and assigned issues
   where someone else commented after you. Anything a workspace already handles stays on that
   workspace's card instead.
+- **GitHub Projects boards** (optional): your items on a board, filtered like one of its views. Code
+  review items join the inbox as "review owed" (or the card of your review worktree), the rest get a
+  compact section per board grouped by status, and status moves show up in the briefing.
 - **Remote machines**: workspaces on saved Herdr SSH machines are included, and a remote checkout of
   the same branch as a local workspace is shown on the local card (for example, experiments running on
   a build box for a paper you are writing locally).
@@ -60,7 +63,8 @@ you a briefing every weekday morning.
 
 - [Herdr](https://herdr.dev) 0.9.3 or newer, with its Claude Code integration (`herdr integration install claude`)
 - Python 3.11 or newer (remote machines only need Python 3.9 for the read-only probe)
-- [GitHub CLI](https://cli.github.com) logged in (`gh auth login`)
+- [GitHub CLI](https://cli.github.com) logged in (`gh auth login`); for Projects boards also
+  `gh auth refresh -s read:project`
 - git; [fzf](https://github.com/junegunn/fzf) for the popup; ssh for remote machines
 - [Claude Code](https://claude.com/claude-code) for the orchestrator session and briefings (the board
   itself works without it)
@@ -115,7 +119,9 @@ popup and the orchestrator edit it for you, keeping your comments; see `override
 
 **`orchestrator.toml`** (optional, copy `orchestrator.example.toml`) holds settings: which branches
 never have their own PR, extra bot logins to ignore, the briefing and end-of-day times, the refresh
-interval, and whether to restore `r`/`b`/`f` workspace kind tags. `ORCH_INTERVAL`,
+interval, whether to restore `r`/`b`/`f` workspace kind tags, and which GitHub Projects boards to
+read (`[[projects]]`: owner, number, and the view whose filter to use, plus the field that marks
+code review items). `ORCH_INTERVAL`,
 `ORCH_BRIEFING_AT`, `ORCH_WHAT_MOVED_AT` and `ORCH_AGENT` override the `[watch]` settings.
 
 **`CLAUDE.local.md`** (optional, git-ignored) gives the orchestrator personal context: your projects,
