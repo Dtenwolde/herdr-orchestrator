@@ -199,7 +199,8 @@ class Watch:
             footer += f" · last event: {self.last_event}"
         if self.note:
             footer += f"\n {self.note}"
-        sys.stdout.write("\033[H\033[2J\n" + board.rstrip() + "\n\n" + footer + "\033[0m")
+        # Clear the scrollback too, so scrolling up shows the top of this board instead of earlier ones.
+        sys.stdout.write("\033[3J\033[H\033[2J\n" + board.rstrip() + "\n\n" + footer + "\033[0m")
         sys.stdout.flush()
 
     # ------------------------------------------------------------ briefings
