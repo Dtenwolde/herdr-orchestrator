@@ -97,7 +97,7 @@ two config blocks.
 
 | | |
 |---|---|
-| Board | Watch the right-hand pane. Enter refetches everything; otherwise it refreshes on events and every minute. |
+| Board | Watch the right-hand pane. Enter refetches everything; otherwise it refreshes on events and every minute. While you scroll up it holds still and catches up when you scroll back down. |
 | `prefix+t` | Triage popup: enter jump, `ctrl-o` open link, `ctrl-p` park, `ctrl-s` snooze, `ctrl-d` done. |
 | `/status` | In the orchestrator session: a short briefing on the top items with a concrete next step each. |
 | `/briefing` | Fills in today's `briefings/YYYY-MM-DD.md` (the board asks for this itself on weekdays). |

@@ -49,6 +49,7 @@ BRIEFING_AT = os.environ.get("ORCH_BRIEFING_AT", SETTINGS["briefing_at"])
 WHAT_MOVED_AT = os.environ.get("ORCH_WHAT_MOVED_AT", SETTINGS["what_moved_at"])
 ORCHESTRATOR = os.environ.get("ORCH_AGENT", SETTINGS["agent"])
 OWN_WORKSPACE = os.environ.get("HERDR_WORKSPACE_ID")
+OWN_PANE = os.environ.get("HERDR_PANE_ID")
 DEBOUNCE = 1.5
 PROMPT_GIVE_UP = 3600
 GLOBAL_EVENTS = ("pane.created", "pane.closed", "pane.exited", "pane.agent_detected", "workspace.created",
@@ -83,6 +84,8 @@ class Events:
             panes = self.agent_panes()
             subs = [{"type": t} for t in GLOBAL_EVENTS]
             subs += [{"type": "pane.agent_status_changed", "pane_id": p} for p in panes]
+            if OWN_PANE:
+                subs.append({"type": "pane.scroll_changed", "pane_id": OWN_PANE})  # to redraw once you scroll back
             sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
             try:
                 sock.connect(os.environ.get("HERDR_SOCKET_PATH", str(Path.home() / ".config/herdr/herdr.sock")))
@@ -171,6 +174,9 @@ class Watch:
         self.prompt_pending_since = None
         self.note = ""
         self.overrides_mtime = self.mtime(OVERRIDES)
+        self.board = None
+        self.board_info = ""
+        self.held = False
 
     @staticmethod
     def mtime(path):
@@ -191,16 +197,33 @@ class Watch:
             args += ["--max-age", "0"]
         started = time.time()
         proc = subprocess.run(args, capture_output=True, text=True, env=dict(os.environ, ORCH_COLOR="1"))
-        board = proc.stdout if proc.returncode == 0 else (proc.stdout + proc.stderr)
+        self.board = proc.stdout if proc.returncode == 0 else (proc.stdout + proc.stderr)
+        self.board_info = f"{datetime.now():%H:%M:%S} · {mode} refresh {time.time() - started:.1f}s"
+        self.draw()
+
+    @staticmethod
+    def scrolled_up():
+        """True while you are reading further up in this pane; redrawing would throw you back down."""
+        if not OWN_PANE:
+            return False
+        pane = (herdr("pane", "get", OWN_PANE) or {}).get("pane") or {}
+        return bool((pane.get("scroll") or {}).get("offset_from_bottom"))
+
+    def draw(self):
+        if self.board is None:
+            return
+        if self.scrolled_up():
+            self.held = True  # Redrawn when the scroll_changed event says you are back at the bottom.
+            return
+        self.held = False
         live = "live" if self.events.sock else "polling (no Herdr events)"
-        footer = (f"\033[2m {datetime.now():%H:%M:%S} · {live} · {mode} refresh {time.time() - started:.1f}s"
-                  " · enter = refetch all")
+        footer = f"\033[2m {self.board_info} · {live} · enter = refetch all"
         if self.last_event:
             footer += f" · last event: {self.last_event}"
         if self.note:
             footer += f"\n {self.note}"
         # Clear the scrollback too, so scrolling up shows the top of this board instead of earlier ones.
-        sys.stdout.write("\033[3J\033[H\033[2J\n" + board.rstrip() + "\n\n" + footer + "\033[0m")
+        sys.stdout.write("\033[3J\033[H\033[2J\n" + self.board.rstrip() + "\n\n" + footer + "\033[0m")
         sys.stdout.flush()
 
     # ------------------------------------------------------------ briefings
@@ -284,6 +307,11 @@ class Watch:
                 continue
             if self.events.sock and self.events.sock in ready:
                 for event in self.events.read():
+                    if kind(event) == "pane_scroll_changed":
+                        offset = ((event.get("data") or {}).get("scroll") or {}).get("offset_from_bottom")
+                        if offset == 0 and self.held:
+                            self.draw()
+                        continue
                     self.last_event = f"{describe(event)} {datetime.now():%H:%M:%S}"
                     if kind(event) == "workspace_focused" and focused_workspace(event) == OWN_WORKSPACE:
                         self.maybe_briefing("open")
@@ -302,6 +330,8 @@ class Watch:
                 if not self.events.sock and now >= self.next_reconnect:
                     self.events.connect()
                     self.next_reconnect = now + 30
+                if self.held:
+                    self.draw()
                 self.maybe_briefing("time")
                 self.maybe_what_moved()
                 self.pump_prompt()
