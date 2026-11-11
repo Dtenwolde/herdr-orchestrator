@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
 """Triage popup over the orchestrator board (Herdr prefix+t).
 
-enter   jump to the workspace (inbox items: open the link)
+enter   jump to the workspace (inbox items: open the link, beans: show the bean)
 ctrl-o  open the PR or issue in the browser
 ctrl-p  park / unpark
 ctrl-s  snooze (pick how long)
 ctrl-d  mark done until there is new activity
+ctrl-b  file a bean for the selected item (when the beans tracker is configured)
 
 Reads state/items.json and state/overrides.toml, so it opens instantly and never calls GitHub.
 """
@@ -25,10 +26,13 @@ _loader = importlib.machinery.SourceFileLoader("herdr_status", str(HERE / "herdr
 _spec = importlib.util.spec_from_loader("herdr_status", _loader)
 hs = importlib.util.module_from_spec(_spec)
 _loader.exec_module(hs)
-hs.load_config()
+CONFIG, _ = hs.load_config()
+BEANS = CONFIG["beans"]
+BEANS_ON = hs.beans_enabled(BEANS)
 
-KEYS = ("ctrl-o", "ctrl-p", "ctrl-s", "ctrl-d")
-HEADER = "enter go · ctrl-o open link · ctrl-p park · ctrl-s snooze · ctrl-d done · esc close"
+KEYS = ("ctrl-o", "ctrl-p", "ctrl-s", "ctrl-d", "ctrl-b")
+HEADER = ("enter go · ctrl-o open link · ctrl-p park · ctrl-s snooze · ctrl-d done"
+          + (" · ctrl-b file bean" if BEANS_ON else "") + " · esc close")
 
 
 def load_units():
@@ -49,8 +53,9 @@ def target(unit):
 
 
 def line(index, unit):
-    prio = "INBOX" if hs.in_inbox(unit) else "BOARD" if hs.in_board(unit) else hs.PRIO_NAMES[unit["priority"]]
-    color = {"INBOX": "pink", "BOARD": "purple"}.get(prio) or hs.PRIO_COLORS[unit["priority"]]
+    prio = ("INBOX" if hs.in_inbox(unit) else ("BEANS" if unit.get("bean") else "BOARD") if hs.in_board(unit)
+            else hs.PRIO_NAMES[unit["priority"]])
+    color = {"INBOX": "pink", "BOARD": "purple", "BEANS": "green"}.get(prio) or hs.PRIO_COLORS[unit["priority"]]
     items = hs.visible_items(unit)
     top = items[0] if items else None
     icon, icon_color = hs.KIND_ICONS.get(top["kind"], ("-", "comment")) if top else (" ", None)
@@ -88,6 +93,59 @@ def preview(snapshot, index):
         if "snooze_label" in entry:
             shown["snooze_until"] = entry["snooze_label"]
         print("\n" + hs.paint(f'[{section}."{key}"] {json.dumps(shown, default=str)}', "comment"))
+    if unit.get("bean"):
+        shown = subprocess.run(["beans", "show", "--raw", unit["workspace"]], capture_output=True, text=True,
+                               env=hs.beans_env(BEANS))
+        print("\n" + shown.stdout.strip())
+
+
+def ask(prompt, default):
+    """One line of input with the default filled in for editing; empty or ctrl-c cancels."""
+    try:
+        import readline
+
+        readline.set_startup_hook(lambda: readline.insert_text(default))
+    except ImportError:
+        readline = None
+        prompt = f"{prompt}[{default}] "
+    try:
+        answer = input(prompt).strip()
+    except (KeyboardInterrupt, EOFError):
+        print()
+        return None
+    finally:
+        if readline:
+            readline.set_startup_hook(None)
+    return answer or (default if readline is None else None)
+
+
+def file_bean(unit, title):
+    """Create a bean for a board item: tagged with its project, the reasons and link in the body."""
+    project_tags = hs.bean_project_tags(hs.fetch_beans(BEANS))
+    tags = sorted(set(unit.get("keys") or []) & project_tags)
+    pr = unit.get("pr") or {}
+    body = [f"Filed from the orchestrator board ({unit['workspace']}).", ""]
+    body += [f"- {hs.item_text(item)}" for item in hs.visible_items(unit) if not item["kind"].startswith("bean")]
+    if pr.get("url"):
+        body += ["", pr["url"]]
+    cmd = ["beans", "create", "--json", title, "-t", "task", "-d", "-"]
+    for tag in tags:
+        cmd += ["--tag", tag]
+    result = subprocess.run(cmd, input="\n".join(body) + "\n", capture_output=True, text=True,
+                            env=hs.beans_env(BEANS))
+    if result.returncode != 0:
+        return f"could not file the bean: {(result.stderr or result.stdout).strip()[:100]}"
+    created = json.loads(result.stdout)
+    bean_id = (created.get("bean") or created).get("id")
+    return f"filed {bean_id}: {title}" + (f" (tags: {', '.join(tags)})" if tags else " (no project tag found)")
+
+
+def default_title(unit):
+    pr = unit.get("pr") or {}
+    if unit.get("inbox") or unit.get("board"):
+        return pr.get("title") or unit["workspace"]
+    items = hs.visible_items(unit)
+    return f"{unit['workspace']}: {hs.board_text(unit, items[0])}" if items else unit["workspace"]
 
 
 def choose_snooze():
@@ -108,6 +166,17 @@ def act(key, unit):
     """Run one action; returns a status line to show when the list reopens, or None to close the popup."""
     section, name = target(unit)
     url = (unit.get("pr") or {}).get("url")
+    if key == "ctrl-b":
+        if not BEANS_ON:
+            return "the beans tracker is not configured (see [beans] in orchestrator.example.toml)"
+        if unit.get("bean"):
+            return f"{name} is a bean already"
+        title = ask("bean title > ", default_title(unit))
+        return file_bean(unit, title) if title else "no bean filed"
+    if unit.get("bean") and key in ("", "ctrl-o"):
+        subprocess.run(f"beans show {hs.shlex.quote(name)} | less -R", shell=True,
+                       env=dict(hs.beans_env(BEANS), CLICOLOR_FORCE="1"))
+        return ""
     if key == "ctrl-o" or (not key and (unit.get("inbox") or unit.get("board"))):
         if url:
             webbrowser.open(url)
@@ -164,7 +233,7 @@ def main():
             unit = units[int(chosen.split("\t", 1)[0])]
             try:
                 status = act(key.strip(), unit)
-            except ValueError as error:
+            except (ValueError, hs.GhError) as error:
                 status = str(error)
             if status is None:
                 return

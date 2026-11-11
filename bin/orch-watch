@@ -31,16 +31,44 @@ OVERRIDES = ROOT / "state" / "overrides.toml"
 def settings():
     """[watch] in orchestrator.toml, overridden by ORCH_* environment variables."""
     config = {"interval": 60, "briefing_at": "09:00", "what_moved_at": "18:00", "agent": "orchestrator",
-              "kind_tags": False}
+              "kind_tags": False, "beans_config": os.environ.get("BEANS_CONFIG")}
     try:
         import tomllib
 
         data = tomllib.loads((ROOT / "orchestrator.toml").read_text())
         config.update(data.get("watch") or {})
         config["kind_tags"] = bool(data.get("kind_tags", False))
+        beans = data.get("beans") or {}
+        if beans.get("enabled") is False:
+            config["beans_config"] = None
+        elif beans.get("config"):
+            config["beans_config"] = beans["config"]
     except (OSError, ValueError, ImportError):
         pass
     return config
+
+
+def beans_dir(config_path):
+    """The data directory of a beans tracker: `beans.path` in its .beans.yml, next to that file."""
+    if not config_path:
+        return None
+    config_file = Path(config_path).expanduser()
+    try:
+        match = re.search(r"(?m)^beans:\s*\n(?:[ \t]+.*\n|\s*\n)*?[ \t]+path:\s*(\S+)", config_file.read_text())
+    except OSError:
+        return None
+    return config_file.parent / (match[1].strip("'\"") if match else ".beans")
+
+
+def beans_stamp(directory):
+    """Changes whenever a bean is created, edited, archived or deleted."""
+    if directory is None:
+        return None
+    try:
+        entries = [(e.name, e.stat().st_mtime_ns) for e in os.scandir(directory) if e.name.endswith(".md")]
+    except OSError:
+        return None
+    return hash(tuple(sorted(entries)))
 
 
 SETTINGS = settings()
@@ -48,6 +76,7 @@ TICK = int(os.environ.get("ORCH_INTERVAL", SETTINGS["interval"]))
 BRIEFING_AT = os.environ.get("ORCH_BRIEFING_AT", SETTINGS["briefing_at"])
 WHAT_MOVED_AT = os.environ.get("ORCH_WHAT_MOVED_AT", SETTINGS["what_moved_at"])
 ORCHESTRATOR = os.environ.get("ORCH_AGENT", SETTINGS["agent"])
+BEANS_DIR = beans_dir(SETTINGS["beans_config"])
 OWN_WORKSPACE = os.environ.get("HERDR_WORKSPACE_ID")
 OWN_PANE = os.environ.get("HERDR_PANE_ID")
 DEBOUNCE = 1.5
@@ -174,6 +203,7 @@ class Watch:
         self.prompt_pending_since = None
         self.note = ""
         self.overrides_mtime = self.mtime(OVERRIDES)
+        self.beans_stamp = beans_stamp(BEANS_DIR)
         self.board = None
         self.board_info = ""
         self.held = False
@@ -299,6 +329,11 @@ class Watch:
                 self.overrides_mtime = mtime
                 self.last_event = f"overrides.toml changed {datetime.now():%H:%M:%S}"
                 self.pending_event_at = self.pending_event_at or time.time() + 0.3
+            stamp = beans_stamp(BEANS_DIR)
+            if stamp != self.beans_stamp:
+                self.beans_stamp = stamp
+                self.last_event = f"beans changed {datetime.now():%H:%M:%S}"
+                self.pending_event_at = self.pending_event_at or time.time() + DEBOUNCE
 
             if sys.stdin in ready:
                 sys.stdin.readline()

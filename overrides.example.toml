@@ -8,6 +8,7 @@
 #   ignore_question = true     drop "agent ended with a question" items
 #   note = "..."               shown on the board and in TODO.md
 #   links = ["owner/repo#n"]   (workspace) issues/PRs it handles: their inbox activity shows on its card
+#   beans = ["tag"]            (workspace) beans with one of these tags belong to it
 #   done = true                (inbox item) dismiss it; done = 2026-11-05 brings it back on newer activity
 #
 #

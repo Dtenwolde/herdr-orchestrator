@@ -13,6 +13,7 @@ description: Brief the user on every Herdr workspace ranked by what needs their 
    - New feedback: `gh pr view <n> --repo <owner/repo> --comments`; say who asked for what.
    - Finished or blocked session: use `summary`, `last_prompt` and `last_reply` from the JSON; read
      the screen with `herdr agent read` only if those do not explain it.
+   - Bean that needs a decision or is critical: `beans show <id>`; state the options from its body.
 3. Run `bin/herdr-status --todo` to regenerate `TODO.md`. Never edit `TODO.md` by hand: everything
    except its Notes section is rewritten on every render, and Notes belong to the user. Read Notes
    when ranking (e.g. "parked") and suggest an override if a note should change the ranking.

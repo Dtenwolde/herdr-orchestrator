@@ -33,7 +33,13 @@
       "Edit(./state/**)",
       "Read(./state/**)",
       "Edit(./briefings/**)",
-      "Read(./briefings/**)"
+      "Read(./briefings/**)",
+      "Bash(beans list:*)",
+      "Bash(beans show:*)",
+      "Bash(beans next:*)",
+      "Bash(beans progress:*)",
+      "Bash(beans milestones:*)",
+      "Bash(beans audit:*)"
     ],
     "deny": [
       "Bash(herdr agent prompt:*)",

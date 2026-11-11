@@ -59,6 +59,11 @@ lives in `CLAUDE.local.md` when the user has one.
 - `bin/orch-watch` runs in the pane to the right: it refreshes the board on Herdr events and every
   minute, plus the sidebar tokens (`ci` ✗/…/✓, `pr` queued/merged/closed, `fb` ✎ feedback, ↻ re-review),
   notifications (including CI turning green) and `TODO.md`.
+- Beans (`[beans]` in `orchestrator.toml`, the user's tracker): beans tagged as needing a decision, or
+  critical and ready, are inbox units or items on a workspace card (kinds `bean-decision`,
+  `bean-critical`); the other open beans are units with `bean: true`, a `group` (project) and a
+  `status` (doing, waiting, ready, blocked, draft). Read more with `beans list --json` and
+  `beans show <id>`. Create or update beans only when the user asks you to, and follow `beans prime`.
 - `bin/orch-pick` is the user's triage popup on `prefix+t`: enter jumps to a workspace (inbox:
   opens the link), ctrl-o opens the PR/issue, ctrl-p/ctrl-s/ctrl-d park, snooze and mark done by
   editing `state/overrides.toml`. Point the user to it for quick triage instead of doing it for them.

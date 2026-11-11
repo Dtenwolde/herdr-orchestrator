@@ -16,6 +16,7 @@ import json
 import os
 import re
 import shlex
+import shutil
 import subprocess
 import sys
 import textwrap
@@ -40,6 +41,9 @@ CONFIG_DEFAULTS = {
     "bots": [],  # extra GitHub logins whose comments never count as feedback
     "kind_tags": False,  # restore r/b/f workspace kind tags (sidebar token $kind)
     "projects": [],  # GitHub Projects boards to read, see orchestrator.example.toml
+    # Beans tracker (https://github.com/hmans/beans). "auto" = on when `beans` and a config are found.
+    "beans": {"enabled": "auto", "config": None, "decision_tags": ["needs-decision"], "waiting_tags": [],
+              "collapsed": ["blocked", "draft"]},
     "watch": {"interval": 60, "briefing_at": "09:00", "what_moved_at": "18:00", "agent": "orchestrator"},
 }
 WORKTREE_ROOT = None
@@ -51,7 +55,7 @@ PRIO_NAMES = {NOW: "NOW", SOON: "SOON", RUNNING: "RUNNING", WAITING: "WAITING", 
 HIDDEN_KINDS = ("nothing", "no-pr")
 # Kinds that come and go on their own; they never count as done or new in TODO.md and the briefings.
 TRANSIENT_KINDS = {"ci-running", "agent-working", "agent-done", "agent-blocked", "agent-question", "reviewing",
-                   "nothing", "no-pr", "merge-queued"}
+                   "nothing", "no-pr", "merge-queued", "beans"}
 BRIEFINGS = ROOT / "briefings"
 CACHE_FILE = STATE_DIR / "cache.json"
 HISTORY_FILE = STATE_DIR / "history.jsonl"
@@ -59,7 +63,7 @@ REMOTE_TTL = 120
 INBOX_TTL = 300
 PROJECT_TTL = 300
 STATUS_COLORS = {"in progress": "cyan", "todo": "yellow", "under review": "purple", "blocked": "red",
-                 "triaging": "orange", "new": "orange"}
+                 "triaging": "orange", "new": "orange", "doing": "cyan", "waiting": "purple", "ready": "green"}
 TOKEN_SOURCE = "custom:orch"
 TOKENS = ("ci", "pr", "fb")
 
@@ -240,8 +244,8 @@ def load_config():
             data = {}
             warnings.append(f"{CONFIG_FILE.name} ignored: {error}")
         for key, value in data.items():
-            if key == "watch" and isinstance(value, dict):
-                config["watch"].update(value)
+            if key in ("watch", "beans") and isinstance(value, dict):
+                config[key].update(value)
             elif key in config:
                 config[key] = value
             else:
@@ -425,6 +429,7 @@ def collect_units(workspaces, agents, panes, exclude=None, toplevel=git_toplevel
             ws_agents = [a for a in agents_by_ws.get(ws_id, [])
                          if path is None or len(paths) == 1 or (a.get("cwd") or "").startswith(path)]
             units.append({"workspace_id": ws_id, "workspace": ws["label"], "path": path,
+                          "repo": (ws.get("worktree") or {}).get("repo_name"),
                           "tokens": ws.get("tokens") or {}, "linked_worktree": bool(ws.get("worktree")),
                           "agents": ws_agents})
     return units
@@ -1023,10 +1028,176 @@ def load_projects(cache, units, warnings, overrides, me, projects):
     return added
 
 
+# ---------------------------------------------------------------------- beans
+
+BEANS_QUERY = ("{ beans { id slug title status type priority tags parentId blockedByIds blockingIds updatedAt "
+               "implicitStatus body } }")
+BEAN_DONE = ("completed", "scrapped")
+BEAN_CONTAINERS = ("epic", "milestone")
+BEAN_STATES = ("doing", "waiting", "ready", "blocked", "draft")
+BEAN_PRIORITIES = ("critical", "high", "normal", "low", "deferred")
+
+
+def beans_env(cfg):
+    env = dict(os.environ)
+    if cfg.get("config"):
+        env["BEANS_CONFIG"] = str(Path(cfg["config"]).expanduser())
+    return env
+
+
+def beans_enabled(cfg):
+    enabled = cfg.get("enabled", "auto")
+    if enabled == "auto":
+        return bool(shutil.which("beans") and (cfg.get("config") or os.environ.get("BEANS_CONFIG")))
+    return bool(enabled)
+
+
+def fetch_beans(cfg):
+    try:
+        proc = subprocess.run(["beans", "graphql", "--json", BEANS_QUERY], capture_output=True, text=True,
+                              timeout=30, env=beans_env(cfg))
+        data = json.loads(proc.stdout)
+    except (OSError, subprocess.TimeoutExpired, ValueError):
+        raise GhError("could not read the tracker (is `beans` installed and its config reachable?)")
+    return (data.get("data") or data)["beans"]
+
+
+def unit_keys(unit):
+    """Names a bean tag can match: workspace label, repository names, checkout directory."""
+    if unit.get("inbox") or unit.get("board"):
+        key = (unit.get("pr") or {}).get("key") or ""
+        return {key.split("#")[0].split("/")[-1]} if "/" in key else set()
+    git = unit.get("git") or {}
+    names = [unit["workspace"], unit.get("repo"), Path(unit["path"]).name if unit.get("path") else None]
+    names += [repo.split("/", 1)[1] for repo in (git.get("remotes") or {}).values()]
+    return {n for n in names if n}
+
+
+def bean_project_tags(beans):
+    """A project is a top-level epic named after its tag, e.g. epic "duckdb" tagged `duckdb`."""
+    return {b["slug"] for b in beans if b["type"] == "epic" and not b.get("parentId") and b.get("slug") in b["tags"]}
+
+
+def bean_units(beans, cfg, units, overrides):
+    """Beans that need you become inbox units (or items on the workspace they clearly belong to); the other
+    open beans become board units, one section per project."""
+    by_id = {b["id"]: b for b in beans}
+    ids = sorted(by_id)
+    prefix = ids[0].rsplit("-", 1)[0] + "-" if ids and "-" in ids[0] else ""
+    if not all(i.startswith(prefix) for i in ids):
+        prefix = ""
+    blockers = {i: set(b.get("blockedByIds") or []) for i, b in by_id.items()}
+    for b in beans:
+        for target in b.get("blockingIds") or []:
+            blockers.setdefault(target, set()).add(b["id"])
+    project_tags = bean_project_tags(beans)
+
+    def ancestors(bean):
+        seen = set()
+        while bean.get("parentId") in by_id and bean["parentId"] not in seen:
+            seen.add(bean["parentId"])
+            bean = by_id[bean["parentId"]]
+            yield bean
+
+    def project_of(bean):
+        chain = [bean, *ancestors(bean)]
+        for member in chain:
+            for tag in member["tags"]:
+                if tag in project_tags:
+                    return tag
+        return chain[-1]["title"] if len(chain) > 1 else "other"
+
+    def is_blocked(bean):
+        return any(by_id.get(blocker, {}).get("status") not in (None, *BEAN_DONE)
+                   for member in (bean, *ancestors(bean)) for blocker in blockers.get(member["id"], ()))
+
+    def state_of(bean):
+        if bean["status"] == "draft":
+            return "draft"
+        if bean["status"] == "in-progress":
+            return "waiting" if set(bean["tags"]) & set(cfg.get("waiting_tags") or []) else "doing"
+        return "blocked" if is_blocked(bean) else "ready"
+
+    local = [u for u in units if not u.get("inbox") and not u.get("board") and not u.get("machine")]
+    claimed_tags = {u["workspace"]: set((overrides["workspace"].get(u["workspace"]) or {}).get("beans") or [])
+                    for u in local}
+
+    def owner_of(bean, project):
+        """The workspace a bean clearly belongs to. In order: claimed through a `beans` override or a PR
+        reference in the body; tagged with the workspace label or branch; the only open workspace of its
+        project. A tie at any step means it belongs to none in particular."""
+        tags = set(bean["tags"])
+        refs = set(refs_in(bean.get("body")))
+        named = tags - project_tags
+        steps = (
+            [u for u in local if tags & claimed_tags[u["workspace"]] or (u.get("pr") or {}).get("key") in refs],
+            [u for u in local if named & {u["workspace"], (u.get("git") or {}).get("branch")}],
+            [u for u in local if project in unit_keys(u)],
+        )
+        for candidates in steps:
+            if candidates:
+                return candidates[0] if len(candidates) == 1 else None
+        return None
+
+    new_units, summaries = [], {}
+    for bean in beans:
+        if (bean["type"] in BEAN_CONTAINERS or bean["status"] in BEAN_DONE
+                or bean.get("implicitStatus") in BEAN_DONE):
+            continue
+        state, project = state_of(bean), project_of(bean)
+        short = bean["id"][len(prefix):]
+        owner = owner_of(bean, project)
+        base = {"workspace": bean["id"], "workspace_id": None, "path": None, "machine": None, "agents": [],
+                "git": None, "tokens": {}, "linked_worktree": False, "active_at": parse_ts(bean["updatedAt"]),
+                "bean": True, "short": short, "keys": [project],
+                "pr": {"key": bean["id"], "number": None, "title": bean["title"], "url": None, "state": "OPEN",
+                       "type": "bean", "ci": {"state": None}}}
+        reason = kind = None
+        if state != "draft" and set(bean["tags"]) & set(cfg.get("decision_tags") or []):
+            reason, kind = "decision needed", "decision"
+        elif state == "ready" and bean["priority"] == "critical":
+            reason, kind = "critical, ready to start", "critical"
+        if kind:
+            item = {"id": f"bean:{bean['id']}:{kind}", "kind": f"bean-{kind}", "base_priority": SOON,
+                    "status": state, "alert": f"bean:{bean['id']}:{kind}"}
+            if owner is not None:
+                owner["items"].append(dict(item, text=f"{reason}: {bean['title']} ({short})", linked=bean["id"]))
+            else:
+                new_units.append(dict(base, inbox=True, items=[dict(
+                    item, text=f"{reason}: {bean['title']}", reason=f"{reason} · {project}")]))
+            continue
+        if owner is not None:
+            counts = summaries.setdefault(id(owner), (owner, {}))[1]
+            counts[state] = counts.get(state, 0) + 1
+        priority = bean["priority"] if bean["priority"] in BEAN_PRIORITIES else "normal"
+        marker = "↑ " if priority in ("critical", "high") else ""
+        new_units.append(dict(
+            base, board=True, project="Beans", group=project, collapsed=state in (cfg.get("collapsed") or []),
+            status_rank=BEAN_STATES.index(state) + BEAN_PRIORITIES.index(priority) / 10,
+            pr=dict(base["pr"], title=marker + bean["title"]),
+            items=[{"id": f"bean:{bean['id']}:open", "kind": "bean", "base_priority": QUIET, "status": state,
+                    "text": f"{project} · {state}: {bean['title']}", "reason": state, "alert": None}]))
+    for owner, counts in summaries.values():
+        text = ", ".join(f"{counts[state]} {state}" for state in BEAN_STATES if counts.get(state))
+        owner["items"].append({"id": f"ws:{owner['workspace']}:beans", "kind": "beans", "base_priority": QUIET,
+                               "text": f"beans: {text}", "alert": None})
+    return new_units
+
+
+def load_beans(units, warnings, overrides, cfg):
+    if not beans_enabled(cfg):
+        return []
+    try:
+        return bean_units(fetch_beans(cfg), cfg, units, overrides)
+    except GhError as error:
+        warnings.append(f"beans: {error}")
+        return []
+
+
 # ------------------------------------------------------------------ overrides
 
 OVERRIDE_FIELDS = {"parked": bool, "snooze_until": object, "ignore_question": bool, "note": str, "links": list,
-                   "done": object}
+                   "done": object, "beans": list}
 
 
 def snooze_timestamp(value):
@@ -1259,6 +1430,8 @@ KIND_ICONS = {
     "stale-changes": ("±", "orange"), "mentioned": ("@", "pink"), "assigned": ("◆", "pink"),
     "issue-activity": ("✎", "comment"), "merge-queued": ("↠", "cyan"), "dequeued": ("✗", "red"),
     "merge-queue-failed": ("✗", "red"), "review-owed": ("↻", "orange"), "board": ("▦", "comment"),
+    "bean-decision": ("?", "orange"), "bean-critical": ("!", "red"), "bean": ("•", "comment"),
+    "beans": ("•", "green"),
 }
 CI_ICONS = {"fail": ("✗", "red"), "pending": ("…", "yellow"), "pass": ("✓", "green")}
 ANSI = re.compile(r"\033\[[0-9;]*m|\033\]8;;[^\033]*\033\\")
@@ -1412,8 +1585,46 @@ def board_sections(units, width):
     return lines
 
 
+def bean_section(units, width):
+    """All open beans in one section: project, state, short id, title; blocked and draft ones as a count."""
+    if not units:
+        return []
+    lines = [rule("BEANS", len(units), "green", width)]
+    groups = sorted({u["group"] for u in units}, key=lambda g: (g == "other", g.lower()))
+    project_width = min(max(len(g) for g in groups), 18)
+    state_width = max(len(u["items"][0]["status"]) for u in units)
+    id_width = max(len(u["short"]) for u in units)
+    indent = " " * (project_width + 2)
+    for group in groups:
+        members = sorted((u for u in units if u["group"] == group),
+                         key=lambda u: (u.get("status_rank") or 0, -(u.get("active_at") or 0)))
+        rows, collapsed = [], {}
+        for u in members:
+            state = u["items"][0]["status"]
+            if u.get("collapsed"):
+                collapsed.setdefault(state, []).append(u["short"])
+                continue
+            room = width - project_width - state_width - id_width - 5
+            short = u["short"]
+            rows.append(f"{paint(f'{state:<{state_width}}', STATUS_COLORS.get(state, 'comment'))} "
+                        f"{paint(f'{short:<{id_width}}', 'comment')} "
+                        f"{clip(u['pr']['title'], room)}")
+            rows += [paint(clip(f"» {note}", width - project_width - 3), "comment", italic=True)
+                     for note in u.get("notes", [])]
+        for state, ids in collapsed.items():
+            rows.append(paint(clip(f"{state:<{state_width}} {len(ids)}: {', '.join(ids)}", width - project_width - 3),
+                              "comment"))
+        for i, row in enumerate(rows):
+            head = paint(f"{clip(group, project_width):<{project_width}}", bold=True) if i == 0 else " " * project_width
+            lines.append(f" {head} {row}")
+    lines.append("")
+    return lines
+
+
 def short_key(key, unit):
     """Drop the owner when it is the board's own organisation: duckdb-internal#11584."""
+    if unit.get("short"):
+        return unit["short"]
     owner, _, rest = key.partition("/")
     return rest if unit.get("board") and owner.lower() == (unit.get("project_owner") or "").lower() else key
 
@@ -1430,7 +1641,8 @@ def render_text(units, width, warnings=()):
     width = max(min(width, 100), 36)
     color = sys.stdout.isatty() or bool(os.environ.get("ORCH_COLOR"))
     inbox = [u for u in units if in_inbox(u)]
-    boards = [u for u in units if in_board(u)]
+    beans = [u for u in units if in_board(u) and u.get("bean")]
+    boards = [u for u in units if in_board(u) and not u.get("bean")]
     board = [u for u in units if on_board(u)]
     counts = {prio: sum(1 for u in board if u["priority"] == prio) for prio in PRIO_NAMES}
 
@@ -1440,6 +1652,7 @@ def render_text(units, width, warnings=()):
 
     chips = [chip(NOW), chip(SOON),
              paint("◆", "pink") + " " + paint(f"{len(inbox)} inbox", None if inbox else "comment"),
+             *([paint("•", "green") + " " + paint(f"{len(beans)} beans")] if beans else []),
              *([paint("▦", "purple") + " " + paint(f"{len(boards)} board")] if boards else []),
              chip(RUNNING), chip(WAITING), chip(CLEANUP),
              paint(f"○ {counts[PARKED]} parked · {counts[QUIET]} quiet", "comment")]
@@ -1471,7 +1684,8 @@ def render_text(units, width, warnings=()):
             lines.extend(inbox_card(u, width) + [""])
     for prio in (RUNNING, WAITING, CLEANUP):
         section(prio)
-    lines.extend(board_sections([u for u in units if in_board(u)], width))
+    lines.extend(bean_section([u for u in units if in_board(u) and u.get("bean")], width))
+    lines.extend(board_sections([u for u in units if in_board(u) and not u.get("bean")], width))
     section(PARKED)
     quiet = [u for u in board if u["priority"] == QUIET]
     if quiet:
@@ -1606,6 +1820,8 @@ def write_items(units, warnings):
         "machine_id": u.get("machine_id"), "inbox": bool(u.get("inbox")), "board": bool(u.get("board")),
         "project": u.get("project"), "status_rank": u.get("status_rank"), "collapsed": u.get("collapsed"),
         "project_owner": u.get("project_owner"), "path": u["path"], "active_at": u.get("active_at"),
+        "bean": bool(u.get("bean")), "short": u.get("short"), "group": u.get("group"),
+        "keys": sorted(u.get("keys") or unit_keys(u)),
         "remotes": [r["workspace"] for r in u.get("remotes", [])],
         "pr": {k: u["pr"].get(k) for k in ("key", "number", "title", "url", "state", "type")} if u.get("pr") else None,
         "items": [{k: i.get(k) for k in ("id", "kind", "base_priority", "text", "reason", "source", "alert", "url",
@@ -1973,6 +2189,7 @@ def main():
         units += load_inbox(cache, units, warnings, overrides, me)
         units += load_projects(cache, units, warnings, overrides, me, config.get("projects") or [])
         units = [u for u in units if not u.get("merged_into")]
+        units += load_beans(units, warnings, overrides, config["beans"])
 
     full = not args.workspace and not args.local
     if full:

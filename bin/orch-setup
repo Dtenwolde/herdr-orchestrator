@@ -99,6 +99,8 @@ def check():
             good = False
         else:
             warn(f"{tool} not found ({why})")
+    if shutil.which("beans"):
+        ok("beans (optional: your beans on the board)")
     if shutil.which("claude"):
         ok("claude (Claude Code)")
     else:

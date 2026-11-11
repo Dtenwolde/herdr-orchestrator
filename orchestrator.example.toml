@@ -29,6 +29,21 @@
 # blocked_statuses = ["Blocked"]    # review items in these statuses rank WAITING instead of SOON
 # collapsed_statuses = ["Long-running"]  # shown as one line
 
+# Beans (https://github.com/hmans/beans), a markdown issue tracker. On by default when the `beans`
+# command and a config (BEANS_CONFIG, or `config` below) are found. Beans that need you (a decision
+# tag, or critical and ready) join the inbox or the card of the workspace they belong to; the other
+# open beans get one BEANS section. A bean belongs to a workspace when the workspace claims its tag
+# (`beans = ["tag"]` in overrides.toml), its body links the workspace's PR, a tag names the workspace
+# or branch, or the workspace is the only one open for the bean's project (a top-level epic named
+# after its tag, e.g. epic "my-repo" tagged my-repo).
+#
+# [beans]
+# enabled = "auto"                      # true, false or "auto"
+# config = "~/tracker/.beans.yml"       # default: $BEANS_CONFIG
+# decision_tags = ["needs-decision"]    # beans waiting on a decision from you
+# waiting_tags = ["external"]           # in-progress beans with these tags show as waiting
+# collapsed = ["blocked", "draft"]      # states shown as a count
+
 [watch]
 # interval = 60            # seconds between ticks; Herdr events refresh in between
 # briefing_at = "09:00"    # weekday briefing (or when you open the orchestrator workspace)

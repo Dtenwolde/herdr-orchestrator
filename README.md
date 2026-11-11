@@ -46,6 +46,10 @@ you a briefing every weekday morning.
 - **GitHub Projects boards** (optional): your items on a board, filtered like one of its views. Code
   review items join the inbox as "review owed" (or the card of your review worktree), the rest get a
   compact section per board grouped by status, and status moves show up in the briefing.
+- **Beans** (optional): if you track work in [beans](https://github.com/hmans/beans), beans that need
+  a decision from you or are critical and ready show in the inbox or on the workspace they belong to,
+  and the other open beans get a compact section by project (doing, waiting, ready, blocked). The
+  board refreshes when a bean changes, and the popup can show a bean or file one from any item.
 - **Remote machines**: workspaces on saved Herdr SSH machines are included, and a remote checkout of
   the same branch as a local workspace is shown on the local card (for example, experiments running on
   a build box for a paper you are writing locally).
@@ -65,7 +69,8 @@ you a briefing every weekday morning.
 - Python 3.11 or newer (remote machines only need Python 3.9 for the read-only probe)
 - [GitHub CLI](https://cli.github.com) logged in (`gh auth login`); for Projects boards also
   `gh auth refresh -s read:project`
-- git; [fzf](https://github.com/junegunn/fzf) for the popup; ssh for remote machines
+- git; [fzf](https://github.com/junegunn/fzf) for the popup; ssh for remote machines;
+  [beans](https://github.com/hmans/beans) if you want your beans on the board
 - [Claude Code](https://claude.com/claude-code) for the orchestrator session and briefings (the board
   itself works without it)
 
@@ -98,7 +103,7 @@ two config blocks.
 | | |
 |---|---|
 | Board | Watch the right-hand pane. Enter refetches everything; otherwise it refreshes on events and every minute. While you scroll up it holds still and catches up when you scroll back down. |
-| `prefix+t` | Triage popup: enter jump, `ctrl-o` open link, `ctrl-p` park, `ctrl-s` snooze, `ctrl-d` done. |
+| `prefix+t` | Triage popup: enter jump (or show the bean), `ctrl-o` open link, `ctrl-p` park, `ctrl-s` snooze, `ctrl-d` done, `ctrl-b` file a bean for the item. |
 | `/status` | In the orchestrator session: a short briefing on the top items with a concrete next step each. |
 | `/briefing` | Fills in today's `briefings/YYYY-MM-DD.md` (the board asks for this itself on weekdays). |
 | Tell it | "Park docs-refresh", "snooze #412 until Monday", "#678 is handled in flaky-tests", "I already did that". |
@@ -116,12 +121,14 @@ popup and the orchestrator edit it for you, keeping your comments; see `override
 | `note = "..."` | Shown on the board, in the popup and in `TODO.md`. |
 | `links = ["owner/repo#n"]` | Issues or PRs this workspace handles; their inbox activity shows on its card. |
 | `done = true` or a date | Dismiss an inbox item; with a date, newer activity brings it back. |
+| `beans = ["tag"]` | Beans with one of these tags belong to this workspace. |
 
 **`orchestrator.toml`** (optional, copy `orchestrator.example.toml`) holds settings: which branches
 never have their own PR, extra bot logins to ignore, the briefing and end-of-day times, the refresh
 interval, whether to restore `r`/`b`/`f` workspace kind tags, and which GitHub Projects boards to
 read (`[[projects]]`: owner, number, and the view whose filter to use, plus the field that marks
-code review items). `ORCH_INTERVAL`,
+code review items), and the beans tracker (`[beans]`: its config file, and which tags mean "needs a
+decision" or "waiting"). `ORCH_INTERVAL`,
 `ORCH_BRIEFING_AT`, `ORCH_WHAT_MOVED_AT` and `ORCH_AGENT` override the `[watch]` settings.
 
 **`CLAUDE.local.md`** (optional, git-ignored) gives the orchestrator personal context: your projects,
